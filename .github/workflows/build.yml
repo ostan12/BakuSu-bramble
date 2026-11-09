@@ -30,7 +30,7 @@ jobs:
           cd work/kernel
           curl -LSs "https://raw.githubusercontent.com/Baka-SU/BakaSU/main/kernel/setup.sh" | bash -
 
-          # Absicherung für Kernel 4.19 (falls Header aus dem SukiSU-Zweig aktiv sind)
+          # Absicherung für Kernel 4.19
           [ -f drivers/kernelsu/Makefile ] && sed -i 's/static_call.h/static_call_disabled_for_4_19.h/g' drivers/kernelsu/Makefile
           [ -f drivers/kernelsu/kernel_includes.h ] && sed -i 's|#include <linux/static_call.h>|/* disabled on 4.19 */|g' drivers/kernelsu/kernel_includes.h
           [ -f drivers/kernelsu/extension/cpu_spoof.c ] && sed -i 's/->vdso_clock_mode/->rating/g' drivers/kernelsu/extension/cpu_spoof.c
@@ -64,7 +64,7 @@ jobs:
                          r'\1#ifdef CONFIG_KSU\n\tksu_handle_sys_reboot(magic1, magic2, cmd, &arg);\n#endif\n', c, count=1)
               save_if_changed("kernel/reboot.c", old, c, "ksu_handle_sys_reboot")
 
-          # 2. fs/exec.c -> ksu_handle_execveat (+ optional ksu_handle_post_execveat)
+          # 2. fs/exec.c -> ksu_handle_execveat
           with open("fs/exec.c", "r") as f:
               c = old = f.read()
           if "ksu_handle_execveat" in ksu_syms:
@@ -95,32 +95,37 @@ jobs:
                          r'\1#ifdef CONFIG_KSU\n\tksu_handle_faccessat(&dfd, &filename, &mode, NULL);\n#endif\n', c, count=1)
               save_if_changed("fs/open.c", old, c, "ksu_handle_faccessat")
 
-          # 4. fs/stat.c -> ksu_handle_stat + ksu_handle_newfstat_ret (wichtig für Android 16/17!)
+          # 4. fs/stat.c -> ksu_handle_stat + newfstat_ret + fstat64_ret (nach allen Includes!)
           with open("fs/stat.c", "r") as f:
               c = old = f.read()
           if "ksu_handle_stat" in ksu_syms:
-              decl = "#ifdef CONFIG_KSU\nextern int ksu_handle_stat(int *dfd, const char __user **filename_user, int *flags);\n"
+              decl = "#ifdef CONFIG_KSU\nstruct stat;\nstruct stat64;\nextern int ksu_handle_stat(int *dfd, const char __user **filename_user, int *flags);\n"
               if "ksu_handle_newfstat_ret" in ksu_syms:
                   decl += "extern void ksu_handle_newfstat_ret(unsigned int *fd, struct stat __user **statbuf_ptr);\n"
               if "ksu_handle_fstat64_ret" in ksu_syms:
                   decl += "extern void ksu_handle_fstat64_ret(unsigned long *fd, struct stat64 __user **statbuf_ptr);\n"
               decl += "#endif\n\n"
-              c = re.sub(r'(#include\s*[<"][^>"]+[>"])', r'\1\n' + decl, c, count=1)
+
+              # Deklarationen direkt vor vfs_statx platzieren (nach allen #include-Zeilen)
+              c = re.sub(r'(int vfs_statx\()', decl + r'\1', c, count=1)
 
               # Hook in vfs_statx
               c = re.sub(r'(int vfs_statx\([^{]+\{[^\n]*\n(?:[ \t]+[^\n]*;[ \t]*\n)+)',
                          r'\1#ifdef CONFIG_KSU\n\tksu_handle_stat(&dfd, &filename, &flags);\n#endif\n', c, count=1)
 
-              # Return-Hook in newfstat für Android 17 ksud rc-injection
+              # Return-Hook gezielt in SYSCALL_DEFINE2(newfstat, ...) (wo vfs_fstat(fd, &stat) genutzt wird)
               if "ksu_handle_newfstat_ret" in ksu_syms:
-                  c = re.sub(r'(error = cp_new_stat\(&stat, statbuf\);)',
+                  c = re.sub(r'(vfs_fstat\(fd,\s*&stat\);\s*if\s*\(!error\)\s*error\s*=\s*cp_new_stat\(&stat,\s*statbuf\);)',
                              r'\1\n#ifdef CONFIG_KSU\n\tksu_handle_newfstat_ret(&fd, &statbuf);\n#endif', c, count=1)
-              if "ksu_handle_fstat64_ret" in ksu_syms:
-                  c = re.sub(r'(error = cp_new_stat64\(&stat, statbuf\);)',
-                             r'\1\n#ifdef CONFIG_KSU\n\tksu_handle_fstat64_ret(&fd, &statbuf);\n#endif', c, count=1)
-              save_if_changed("fs/stat.c", old, c, "ksu_handle_stat + newfstat_ret")
 
-          # 5. fs/read_write.c -> ksu_handle_vfs_read / ksu_handle_sys_read
+              # Return-Hook gezielt in SYSCALL_DEFINE2(fstat64, ...) (wo vfs_fstat(fd, &stat) genutzt wird)
+              if "ksu_handle_fstat64_ret" in ksu_syms:
+                  c = re.sub(r'(vfs_fstat\(fd,\s*&stat\);\s*if\s*\(!error\)\s*error\s*=\s*cp_new_stat64\(&stat,\s*statbuf\);)',
+                             r'\1\n#ifdef CONFIG_KSU\n\tksu_handle_fstat64_ret(&fd, &statbuf);\n#endif', c, count=1)
+
+              save_if_changed("fs/stat.c", old, c, "ksu_handle_stat + newfstat_ret + fstat64_ret")
+
+          # 5. fs/read_write.c -> ksu_handle_vfs_read
           with open("fs/read_write.c", "r") as f:
               c = old = f.read()
           if "ksu_handle_vfs_read" in ksu_syms:
