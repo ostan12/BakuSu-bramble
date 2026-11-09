@@ -64,24 +64,13 @@ jobs:
                          r'\1#ifdef CONFIG_KSU\n\tksu_handle_sys_reboot(magic1, magic2, cmd, &arg);\n#endif\n', c, count=1)
               save_if_changed("kernel/reboot.c", old, c, "ksu_handle_sys_reboot")
 
-          # 2. fs/exec.c -> ksu_handle_execveat
+          # 2. fs/exec.c -> ksu_handle_execveat (sauber direkt auf Basis gefundener Symbole)
           with open("fs/exec.c", "r") as f:
               c = old = f.read()
           if "ksu_handle_execveat" in ksu_syms:
-              has_hook_flag = "ksu_execveat_hook" in ksu_syms
-              has_sucompat = "ksu_handle_execveat_sucompat" in ksu_syms
-              decl = "#ifdef CONFIG_KSU\nstruct filename;\n"
-              if has_hook_flag:
-                  decl += "extern bool ksu_execveat_hook __read_mostly;\n"
-              decl += "extern int ksu_handle_execveat(int *fd, struct filename **filename_ptr, void *argv, void *envp, int *flags);\n"
-              if has_sucompat:
-                  decl += "extern int ksu_handle_execveat_sucompat(int *fd, struct filename **filename_ptr, void *argv, void *envp, int *flags);\n"
-              decl += "#endif\n"
+              decl = "#ifdef CONFIG_KSU\nstruct filename;\nextern int ksu_handle_execveat(int *fd, struct filename **filename_ptr, void *argv, void *envp, int *flags);\n#endif\n\n"
               c = re.sub(r'(#include\s*[<"][^>"]+[>"])', r'\1\n' + decl, c, count=1)
-              if has_hook_flag and has_sucompat:
-                  hook = "#ifdef CONFIG_KSU\n\tif (unlikely(ksu_execveat_hook))\n\t\tksu_handle_execveat(&fd, &filename, &argv, &envp, &flags);\n\telse\n\t\tksu_handle_execveat_sucompat(&fd, &filename, &argv, &envp, &flags);\n#endif\n\t"
-              else:
-                  hook = "#ifdef CONFIG_KSU\n\tksu_handle_execveat(&fd, &filename, &argv, &envp, &flags);\n#endif\n\t"
+              hook = "#ifdef CONFIG_KSU\n\tksu_handle_execveat(&fd, &filename, &argv, &envp, &flags);\n#endif\n\t"
               c = re.sub(r'(if \(IS_ERR\(filename\)\))', hook + r'\1', c, count=1)
               save_if_changed("fs/exec.c", old, c, "ksu_handle_execveat")
 
@@ -95,7 +84,7 @@ jobs:
                          r'\1#ifdef CONFIG_KSU\n\tksu_handle_faccessat(&dfd, &filename, &mode, NULL);\n#endif\n', c, count=1)
               save_if_changed("fs/open.c", old, c, "ksu_handle_faccessat")
 
-          # 4. fs/stat.c -> ksu_handle_stat + newfstat_ret + fstat64_ret (nach allen Includes!)
+          # 4. fs/stat.c -> ksu_handle_stat + newfstat_ret + fstat64_ret
           with open("fs/stat.c", "r") as f:
               c = old = f.read()
           if "ksu_handle_stat" in ksu_syms:
@@ -106,19 +95,13 @@ jobs:
                   decl += "extern void ksu_handle_fstat64_ret(unsigned long *fd, struct stat64 __user **statbuf_ptr);\n"
               decl += "#endif\n\n"
 
-              # Deklarationen direkt vor vfs_statx platzieren (nach allen #include-Zeilen)
               c = re.sub(r'(int vfs_statx\()', decl + r'\1', c, count=1)
-
-              # Hook in vfs_statx
               c = re.sub(r'(int vfs_statx\([^{]+\{[^\n]*\n(?:[ \t]+[^\n]*;[ \t]*\n)+)',
                          r'\1#ifdef CONFIG_KSU\n\tksu_handle_stat(&dfd, &filename, &flags);\n#endif\n', c, count=1)
 
-              # Return-Hook gezielt in SYSCALL_DEFINE2(newfstat, ...) (wo vfs_fstat(fd, &stat) genutzt wird)
               if "ksu_handle_newfstat_ret" in ksu_syms:
                   c = re.sub(r'(vfs_fstat\(fd,\s*&stat\);\s*if\s*\(!error\)\s*error\s*=\s*cp_new_stat\(&stat,\s*statbuf\);)',
                              r'\1\n#ifdef CONFIG_KSU\n\tksu_handle_newfstat_ret(&fd, &statbuf);\n#endif', c, count=1)
-
-              # Return-Hook gezielt in SYSCALL_DEFINE2(fstat64, ...) (wo vfs_fstat(fd, &stat) genutzt wird)
               if "ksu_handle_fstat64_ret" in ksu_syms:
                   c = re.sub(r'(vfs_fstat\(fd,\s*&stat\);\s*if\s*\(!error\)\s*error\s*=\s*cp_new_stat64\(&stat,\s*statbuf\);)',
                              r'\1\n#ifdef CONFIG_KSU\n\tksu_handle_fstat64_ret(&fd, &statbuf);\n#endif', c, count=1)
