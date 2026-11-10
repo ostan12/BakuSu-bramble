@@ -46,7 +46,7 @@ jobs:
           [ -f drivers/kernelsu/kernel_includes.h ] && sed -i 's|#include <linux/static_call.h>|/* disabled on 4.19 */|g' drivers/kernelsu/kernel_includes.h
           [ -f drivers/kernelsu/extension/cpu_spoof.c ] && sed -i 's/->vdso_clock_mode/->rating/g' drivers/kernelsu/extension/cpu_spoof.c
 
-          # 5. Python-Patcher: Löst SuSFS-Rejects auf & setzt ksu_handle_setresuid
+          # 5. Python-Patcher: Löst SuSFS-Rejects auf & setzt alle SuSFS-Hooks
           python3 - << 'PYEOF'
           import re, subprocess
 
@@ -70,33 +70,35 @@ jobs:
                          r'\1\n#ifdef CONFIG_KSU_SUSFS\n\tu64 susfs_mnt_id_backup;\n#endif', c, count=1)
               save_if_changed("include/linux/mount.h", old, c, "susfs_mnt_id_backup in struct vfsmount")
 
-          # --- B. SuSFS Rejects in fs/pnode.h auflösen ---
-          with open("fs/pnode.h", "r") as f:
-              c = old = f.read()
-          if "CL_COPY_MNT_NS" not in c:
-              c += "\n#ifndef CL_COPY_MNT_NS\n#define CL_COPY_MNT_NS 0x100\n#endif\n"
-              save_if_changed("fs/pnode.h", old, c, "CL_COPY_MNT_NS")
+          # --- B. SuSFS Flags in include/linux/susfs.h absichern ---
+          with open("include/linux/susfs.h", "r") as f:
+              s = f.read()
+          if "CL_COPY_MNT_NS" not in s:
+              s += "\n#ifndef CL_COPY_MNT_NS\n#define CL_COPY_MNT_NS 0x20\n#endif\n#ifndef CL_ZYGOTE_COPY_MNT_NS\n#define CL_ZYGOTE_COPY_MNT_NS 0x40\n#endif\n"
+              with open("include/linux/susfs.h", "w") as f:
+                  f.write(s)
+              print("[OK] include/linux/susfs.h gepatcht (CL_COPY_MNT_NS)")
 
           # --- C. SuSFS Rejects in fs/namespace.c auflösen ---
           with open("fs/namespace.c", "r") as f:
               c = old = f.read()
 
-          # Header einbinden
+          # Header direkt nach dem ersten Include einbinden
           if "<linux/susfs.h>" not in c:
-              c = re.sub(r'(#include\s*<linux/mount\.h>)',
-                         r'\1\n#ifdef CONFIG_KSU_SUSFS\n#include <linux/susfs.h>\n#endif', c, count=1)
+              c = re.sub(r'(#include\s*<[^>]+>\n)',
+                         r'\1#ifdef CONFIG_KSU_SUSFS\n#include <linux/susfs.h>\n#endif\n', c, count=1)
 
-          # mnt_alloc_id Aufrufe auf 3 Argumente korrigieren
-          c = re.sub(r'err\s*=\s*mnt_alloc_id\(mnt\);(\s*if\s*\(err\))',
-                     r'#ifdef CONFIG_KSU_SUSFS\n\terr = mnt_alloc_id(mnt, false, false);\n#else\n\terr = mnt_alloc_id(mnt);\n#endif\1', c, count=1)
-          c = re.sub(r'err\s*=\s*mnt_alloc_id\(mnt\);(\s*if\s*\(err\))',
-                     r'#ifdef CONFIG_KSU_SUSFS\n\terr = mnt_alloc_id(mnt, (flag & CL_COPY_MNT_NS) ? true : false, false);\n#else\n\terr = mnt_alloc_id(mnt);\n#endif\1', c, count=1)
+          # mnt_alloc_id Aufrufe anpassen: 1. alloc_vfsmnt, 2. clone_mnt
+          c = re.sub(r'\bmnt_alloc_id\(mnt\)', 'mnt_alloc_id(mnt, false, false)', c, count=1)
+          c = re.sub(r'\bmnt_alloc_id\(mnt\)',
+                     'mnt_alloc_id(mnt, (flag & CL_COPY_MNT_NS) ? true : false, (flag & CL_ZYGOTE_COPY_MNT_NS) ? true : false)',
+                     c, count=1)
 
           save_if_changed("fs/namespace.c", old, c, "SuSFS namespace fixes")
 
-          # --- D. BakaSU Hooks setzen (inkl. ksu_handle_setresuid) ---
+          # --- D. BakaSU Hooks ---
 
-          # 1. kernel/sys.c -> ksu_handle_setresuid (Löst inline_hook_check.mk Fehler)
+          # 1. kernel/sys.c -> ksu_handle_setresuid
           with open("kernel/sys.c", "r") as f:
               c = old = f.read()
           if "ksu_handle_setresuid" not in c:
@@ -160,22 +162,19 @@ jobs:
 
               save_if_changed("fs/stat.c", old, c, "ksu_handle_stat + newfstat_ret + fstat64_ret")
 
-          # 6. fs/read_write.c -> ksu_handle_vfs_read
+          # 6. fs/read_write.c -> ksu_handle_sys_read (löst 'You lost ksu_handle_sys_read hook')
           with open("fs/read_write.c", "r") as f:
               c = old = f.read()
-          if "ksu_handle_vfs_read" in ksu_syms and "ksu_handle_vfs_read" not in c:
-              has_read_flag = "ksu_vfs_read_hook" in ksu_syms
-              decl = "#ifdef CONFIG_KSU\n"
-              if has_read_flag:
-                  decl += "extern bool ksu_vfs_read_hook __read_mostly;\n"
-              decl += "extern int ksu_handle_vfs_read(struct file **file_ptr, char __user **buf_ptr, size_t *count_ptr, loff_t **pos);\n#endif\n\n"
-              c = re.sub(r'(ssize_t vfs_read\()', decl + r'\1', c, count=1)
-              hook = "#ifdef CONFIG_KSU\n\tif (unlikely(ksu_vfs_read_hook))\n\t\tksu_handle_vfs_read(&file, &buf, &count, &pos);\n#endif\n" if has_read_flag else "#ifdef CONFIG_KSU\n\tksu_handle_vfs_read(&file, &buf, &count, &pos);\n#endif\n"
-              c = re.sub(r'(ssize_t vfs_read\([^{]+\{[^\n]*\n(?:[ \t]+[^\n]*;[ \t]*\n)+)', r'\1' + hook, c, count=1)
-              save_if_changed("fs/read_write.c", old, c, "ksu_handle_vfs_read")
+
+          if "ksu_handle_sys_read" not in c:
+              decl = "#ifdef CONFIG_KSU\nextern int ksu_handle_sys_read(unsigned int fd, char __user **buf_ptr, size_t *count_ptr);\n#endif\n\n"
+              c = re.sub(r'(SYSCALL_DEFINE3\(read,)', decl + r'\1', c, count=1)
+              c = re.sub(r'(SYSCALL_DEFINE3\(read,[^{]+\{[^\n]*\n(?:[ \t]+[^\n]*;[ \t]*\n)+)',
+                         r'\1#ifdef CONFIG_KSU\n\tksu_handle_sys_read(fd, &buf, &count);\n#endif\n', c, count=1)
+              save_if_changed("fs/read_write.c", old, c, "ksu_handle_sys_read in SYSCALL_DEFINE3(read)")
           PYEOF
 
-          # Defconfig für BakaSU + SuSFS vorbereiten
+          # Defconfig für BakaSU + SuSFS
           DEFCONFIG=$(find arch/arm64/configs -name "redbull_defconfig" | head -n 1)
           printf '%s\n' \
             "CONFIG_KSU=y" \
@@ -200,7 +199,7 @@ jobs:
           git config user.email "builder@local"
           git config user.name "builder"
           git add -A
-          git commit -m "Integrate BakaSU and SuSFS 4.19" || true
+          git commit -m "Integrate BakaSU and SuSFS 4.19 with complete hooks" || true
 
       - name: Compile Kernel (Image.lz4)
         run: |
@@ -214,7 +213,6 @@ jobs:
             CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
             "$DEFCONFIG_REL"
 
-          # SuSFS-Flags explizit in out/.config aktivieren
           ./scripts/config --file out/.config \
             -e KSU \
             -e KSU_MANUAL_HOOK \
