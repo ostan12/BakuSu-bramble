@@ -44,14 +44,14 @@ jobs:
           # 2. SuSFS 4.19 Basis-Patch anwenden
           patch -p1 --forward < ../susfs4ksu/kernel_patches/50_add_susfs_in_kernel-4.19.patch || true
 
-          # 3. ZWINGEND susfs.o in fs/Makefile fest verdrahten
-          sed -i '/susfs.o/d' fs/Makefile
+          # 3. susfs.o fest in fs/Makefile verdrahten (garantiert das Kompilieren von fs/susfs.c)
+          sed -i '/susfs/d' fs/Makefile
           echo "obj-y += susfs.o" >> fs/Makefile
 
-          # 4. In fs/susfs.c sicherstellen, dass die Symbole global sind und die Configs aktiv sind
-          sed -i 's/static DEFINE_IDA(susfs_mnt_id_ida);/DEFINE_IDA(susfs_mnt_id_ida);/g' fs/susfs.c 2>/dev/null || true
-          sed -i 's/static DEFINE_IDA(susfs_mnt_group_ida);/DEFINE_IDA(susfs_mnt_group_ida);/g' fs/susfs.c 2>/dev/null || true
-          sed -i '1i #ifndef CONFIG_KSU_SUSFS\n#define CONFIG_KSU_SUSFS 1\n#endif\n#ifndef CONFIG_SUSFS\n#define CONFIG_SUSFS 1\n#endif\n#ifndef CONFIG_KSU_SUSFS_SUS_MOUNT\n#define CONFIG_KSU_SUSFS_SUS_MOUNT 1\n#endif' fs/susfs.c 2>/dev/null || true
+          # 4. In fs/susfs.c sicherstellen, dass alle Features aktiviert sind
+          if [ -f fs/susfs.c ]; then
+            sed -i '1i #ifndef CONFIG_KSU_SUSFS\n#define CONFIG_KSU_SUSFS 1\n#endif\n#ifndef CONFIG_SUSFS\n#define CONFIG_SUSFS 1\n#endif\n#ifndef CONFIG_KSU_SUSFS_SUS_MOUNT\n#define CONFIG_KSU_SUSFS_SUS_MOUNT 1\n#endif' fs/susfs.c
+          fi
 
           # 5. BakaSU integrieren
           curl -LSs "https://raw.githubusercontent.com/Baka-SU/BakaSU/main/kernel/setup.sh" | bash -
@@ -61,7 +61,7 @@ jobs:
           [ -f drivers/kernelsu/kernel_includes.h ] && sed -i 's|#include <linux/static_call.h>|/* disabled on 4.19 */|g' drivers/kernelsu/kernel_includes.h
           [ -f drivers/kernelsu/extension/cpu_spoof.c ] && sed -i 's/->vdso_clock_mode/->rating/g' drivers/kernelsu/extension/cpu_spoof.c
 
-          # 7. Python-Patcher: Löst alle Rejects und Hooks fehlerfrei auf
+          # 7. Python-Patcher: Löst alle Rejects, Hooks und IDA-Definitionen auf
           python3 - << 'PYEOF'
           import re, os, subprocess
 
@@ -117,6 +117,7 @@ jobs:
                           "#endif\n"
                       )
                       txt = disp_stub + txt
+                  # Wandelt susfs_xxx(arg) in susfs_xxx((void *)*arg) um
                   txt = re.sub(r'(susfs_[a-z0-9_]+)\(\s*arg\s*\)', r'\1((void *)*arg)', txt)
                   with open(fp, "w") as f:
                       f.write(txt)
@@ -153,16 +154,20 @@ jobs:
                   f.write(pnh)
               print("[OK] fs/pnode.h gepatcht")
 
-          # --- F. fs/namespace.c Rejects auflösen ---
+          # --- F. fs/namespace.c: IDAs fest definieren (ohne extern) ---
           with open("fs/namespace.c", "r") as f:
               ns = f.read()
+
+          # Entferne eventuelle fehlerhafte Vorab-Deklarationen
+          ns = re.sub(r'extern struct ida susfs_mnt_id_ida;\n?', '', ns)
+          ns = re.sub(r'extern struct ida susfs_mnt_group_ida;\n?', '', ns)
 
           hunk1 = (
               "\n#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\n"
               "#include <linux/susfs.h>\n"
               "extern bool susfs_is_current_zygote_domain(void);\n"
-              "extern struct ida susfs_mnt_id_ida;\n"
-              "extern struct ida susfs_mnt_group_ida;\n"
+              "DEFINE_IDA(susfs_mnt_id_ida);\n"
+              "DEFINE_IDA(susfs_mnt_group_ida);\n"
               "#ifndef DEFAULT_SUS_MNT_ID\n#define DEFAULT_SUS_MNT_ID 100000\n#endif\n"
               "#ifndef DEFAULT_SUS_MNT_GROUP_ID\n#define DEFAULT_SUS_MNT_GROUP_ID 1000\n#endif\n"
               "#ifndef DEFAULT_SUS_MNT_ID_FOR_KSU_PROC_UNSHARE\n#define DEFAULT_SUS_MNT_ID_FOR_KSU_PROC_UNSHARE 1000000\n#endif\n"
@@ -170,21 +175,24 @@ jobs:
               "#ifndef CL_ZYGOTE_COPY_MNT_NS\n#define CL_ZYGOTE_COPY_MNT_NS 0x40\n#endif\n"
               "#endif\n"
           )
-          if "extern struct ida susfs_mnt_id_ida;" not in ns:
+          if "DEFINE_IDA(susfs_mnt_id_ida);" not in ns:
               ns = hunk1 + ns
 
+          # Hunk 7: alloc_vfsmnt
           ns = re.sub(
               r'alloc_vfsmnt\((fc->source \?: "none"|name)\)',
               r'alloc_vfsmnt(\1, false, 0)',
               ns
           )
 
+          # Hunk 9: clone_mnt
           ns = re.sub(
               r'alloc_vfsmnt\(old->mnt_devname\)',
               r'alloc_vfsmnt(old->mnt_devname, (flag & CL_COPY_MNT_NS) ? true : false, (flag & CL_ZYGOTE_COPY_MNT_NS) ? DEFAULT_SUS_MNT_ID_FOR_KSU_PROC_UNSHARE : 0)',
               ns
           )
 
+          # Hunk 10: susfs_mnt_id_backup
           if "mnt->mnt.susfs_mnt_id_backup = old->mnt.susfs_mnt_id_backup;" not in ns:
               ns = re.sub(
                   r'(mnt->mnt\.mnt_flags\s*=\s*old->mnt\.mnt_flags;)',
@@ -194,7 +202,7 @@ jobs:
 
           with open("fs/namespace.c", "w") as f:
               f.write(ns)
-          print("[OK] fs/namespace.c gepatcht")
+          print("[OK] fs/namespace.c gepatcht (IDAs definiert)")
 
           # --- G. Die 7 BakaSU Pflicht-Hooks ---
           # 1. drivers/input/input.c
@@ -263,7 +271,7 @@ jobs:
                   f.write(oc)
               print("[OK] fs/open.c gepatcht")
 
-          # 6. fs/stat.c -> nur ksu_handle_stat
+          # 6. fs/stat.c -> nur ksu_handle_stat (keine newfstat_ret/fstat64_ret)
           with open("fs/stat.c", "r") as f:
               stc = f.read()
           if "ksu_handle_stat" not in stc:
@@ -271,6 +279,9 @@ jobs:
               stc = re.sub(r'(int vfs_statx\()', decl + r'\1', stc, count=1)
               stc = re.sub(r'(int vfs_statx\([^{]+\{[^\n]*\n(?:[ \t]+[^\n]*;[ \t]*\n)+)',
                            r'\1#ifdef CONFIG_KSU\n\tksu_handle_stat(&dfd, &filename, &flags);\n#endif\n', stc, count=1)
+              # Entferne eventuelle Alt-Hooks aus früheren Tests
+              stc = re.sub(r'#ifdef CONFIG_KSU\n\tksu_handle_newfstat_ret.*?\n#endif\n?', '', stc)
+              stc = re.sub(r'#ifdef CONFIG_KSU\n\tksu_handle_fstat64_ret.*?\n#endif\n?', '', stc)
               with open("fs/stat.c", "w") as f:
                   f.write(stc)
               print("[OK] fs/stat.c gepatcht")
