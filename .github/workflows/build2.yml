@@ -73,4 +73,253 @@ jobs:
 
           # --- FIX B: SuSFS Rejects in include/linux/mount.h ---
           with open("include/linux/mount.h", "r") as f:
-              c = old = f.
+              c = old = f.read()
+          if "susfs_mnt_id_backup" not in c:
+              c = re.sub(r'(int\s+mnt_flags;)',
+                         r'\1\n#ifdef CONFIG_KSU_SUSFS\n\tu64 susfs_mnt_id_backup;\n#endif\n', c, count=1)
+              save_if_changed("include/linux/mount.h", old, c, "susfs_mnt_id_backup")
+
+          # --- FIX C: SuSFS Rejects in fs/namespace.c (Ohne unterminated #endif) ---
+          with open("fs/namespace.c", "r") as f:
+              c = old = f.read()
+
+          susfs_top_defs = (
+              "\n#ifdef CONFIG_KSU_SUSFS\n"
+              "#include <linux/susfs.h>\n"
+              "extern bool susfs_is_current_zygote_domain(void);\n"
+              "static DEFINE_IDA(susfs_mnt_id_ida);\n"
+              "static DEFINE_IDA(susfs_mnt_group_ida);\n"
+              "#ifndef DEFAULT_SUS_MNT_ID\n#define DEFAULT_SUS_MNT_ID 100000\n#endif\n"
+              "#ifndef DEFAULT_SUS_MNT_GROUP_ID\n#define DEFAULT_SUS_MNT_GROUP_ID 100000\n#endif\n"
+              "#ifndef DEFAULT_SUS_MNT_ID_FOR_KSU_PROC_UNSHARE\n#define DEFAULT_SUS_MNT_ID_FOR_KSU_PROC_UNSHARE 1000000\n#endif\n"
+              "#ifndef CL_COPY_MNT_NS\n#define CL_COPY_MNT_NS 0x100\n#endif\n"
+              "#ifndef CL_ZYGOTE_COPY_MNT_NS\n#define CL_ZYGOTE_COPY_MNT_NS 0x200\n#endif\n"
+              "#endif\n"
+          )
+          if "susfs_is_current_zygote_domain" not in c:
+              c = re.sub(r'(#include\s*<[^>]+>\n)', r'\1' + susfs_top_defs, c, count=1)
+
+          # Rollback für fehlgeschlagene mnt_alloc_id Patches
+          c = re.sub(r'\bmnt_alloc_id\(mnt,\s*false,\s*false\)', 'mnt_alloc_id(mnt)', c)
+
+          # Ersetze die gesamte mnt_alloc_id Funktion
+          match = re.search(r'static int mnt_alloc_id\(struct mount \*mnt\)\n\{.*?\n\}', c, flags=re.DOTALL)
+          if match and "CONFIG_KSU_SUSFS_SUS_MOUNT" not in match.group(0):
+              old_func = match.group(0)
+              new_func = """#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
+          static int mnt_alloc_id(struct mount *mnt, bool is_copy_mnt_ns, bool is_zygote_copy_mnt_ns)
+          {
+          \tint res;
+          \tif (is_copy_mnt_ns) {
+          \t\tres = ida_simple_get(&susfs_mnt_id_ida, DEFAULT_SUS_MNT_ID, 0, GFP_KERNEL);
+          \t} else if (is_zygote_copy_mnt_ns) {
+          \t\tres = ida_simple_get(&susfs_mnt_id_ida, DEFAULT_SUS_MNT_ID_FOR_KSU_PROC_UNSHARE, 0, GFP_KERNEL);
+          \t} else {
+          \t\tres = ida_simple_get(&mnt_id_ida, 0, 0, GFP_KERNEL);
+          \t}
+          \tif (res < 0)
+          \t\treturn res;
+          \tmnt->mnt_id = res;
+          \treturn 0;
+          }
+          #else\n""" + old_func + "\n#endif\n"
+              c = c.replace(old_func, new_func)
+
+          # 3 Argumente Aufrufe in alloc_vfsmnt und clone_mnt
+          def_pos = c.find("alloc_vfsmnt(")
+          if def_pos != -1:
+              def_end = c.find("}", def_pos)
+              call1 = c.find("err = mnt_alloc_id(mnt);", def_pos, def_end)
+              if call1 != -1:
+                  c = c[:call1] + "#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\n\terr = mnt_alloc_id(mnt, false, false);\n#else\n\terr = mnt_alloc_id(mnt);\n#endif\n" + c[call1 + len("err = mnt_alloc_id(mnt);"):]
+
+          def_pos = c.find("clone_mnt(")
+          if def_pos != -1:
+              def_end = c.find("}", def_pos)
+              call2 = c.find("err = mnt_alloc_id(mnt);", def_pos, def_end)
+              if call2 != -1:
+                  c = c[:call2] + "#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\n\terr = mnt_alloc_id(mnt, (flag & CL_COPY_MNT_NS) ? true : false, (flag & CL_ZYGOTE_COPY_MNT_NS) ? true : false);\n#else\n\terr = mnt_alloc_id(mnt);\n#endif\n" + c[call2 + len("err = mnt_alloc_id(mnt);"):]
+          
+          save_if_changed("fs/namespace.c", old, c, "SuSFS namespace fixes")
+
+          # --- D. Die 7 BakaSU Pflicht-Hooks ---
+          # 1. drivers/input/input.c -> ksu_handle_input_handle_event
+          with open("drivers/input/input.c", "r") as f:
+              c = old = f.read()
+          target_input = "static void input_handle_event(struct input_dev *dev,"
+          if target_input in c and "ksu_handle_input_handle_event" not in c:
+              pos = c.find(target_input)
+              decl = "#ifdef CONFIG_KSU\nextern int ksu_handle_input_handle_event(unsigned int *type, unsigned int *code, int *value);\n#endif\n"
+              brace_pos = c.find("{", pos)
+              hook = "\n#ifdef CONFIG_KSU\n\tksu_handle_input_handle_event(&type, &code, &value);\n#endif"
+              c = c[:pos] + decl + c[pos:brace_pos + 1] + hook + c[brace_pos + 1:]
+              save_if_changed("drivers/input/input.c", old, c, "ksu_handle_input_handle_event")
+
+          # 2. kernel/sys.c -> ksu_handle_setresuid
+          with open("kernel/sys.c", "r") as f:
+              c = old = f.read()
+          if "ksu_handle_setresuid" not in c:
+              decl = "#ifdef CONFIG_KSU\nextern int ksu_handle_setresuid(uid_t ruid, uid_t euid, uid_t suid);\n#endif\n\n"
+              c = re.sub(r'(long __sys_setresuid\()', decl + r'\1', c, count=1)
+              c = re.sub(r'(long __sys_setresuid\([^{]+\{[^\n]*\n(?:[ \t]+[^\n]*;[ \t]*\n)+)',
+                         r'\1#ifdef CONFIG_KSU\n\tksu_handle_setresuid(ruid, euid, suid);\n#endif\n', c, count=1)
+              save_if_changed("kernel/sys.c", old, c, "ksu_handle_setresuid")
+
+          # 3. kernel/reboot.c -> ksu_handle_sys_reboot
+          with open("kernel/reboot.c", "r") as f:
+              c = old = f.read()
+          if "ksu_handle_sys_reboot" in ksu_syms and "ksu_handle_sys_reboot" not in c:
+              decl = "#ifdef CONFIG_KSU\nextern int ksu_handle_sys_reboot(int magic1, int magic2, unsigned int cmd, void __user **arg);\n#endif\n\n"
+              c = re.sub(r'(SYSCALL_DEFINE4\(reboot,)', decl + r'\1', c, count=1)
+              c = re.sub(r'(SYSCALL_DEFINE4\(reboot,[^{]+\{[^\n]*\n(?:[ \t]+[^\n]*;[ \t]*\n)+)',
+                         r'\1#ifdef CONFIG_KSU\n\tksu_handle_sys_reboot(magic1, magic2, cmd, &arg);\n#endif\n', c, count=1)
+              save_if_changed("kernel/reboot.c", old, c, "ksu_handle_sys_reboot")
+
+          # 4. fs/exec.c -> ksu_handle_execveat
+          with open("fs/exec.c", "r") as f:
+              c = old = f.read()
+          if "ksu_handle_execveat" in ksu_syms and "ksu_handle_execveat" not in c:
+              decl = "#ifdef CONFIG_KSU\nstruct filename;\nextern int ksu_handle_execveat(int *fd, struct filename **filename_ptr, void *argv, void *envp, int *flags);\n#endif\n\n"
+              c = re.sub(r'(#include\s*[<"][^>"]+[>"])', r'\1\n' + decl, c, count=1)
+              hook = "#ifdef CONFIG_KSU\n\tksu_handle_execveat(&fd, &filename, &argv, &envp, &flags);\n#endif\n\t"
+              c = re.sub(r'(if \(IS_ERR\(filename\)\))', hook + r'\1', c, count=1)
+              save_if_changed("fs/exec.c", old, c, "ksu_handle_execveat")
+
+          # 5. fs/open.c -> ksu_handle_faccessat
+          with open("fs/open.c", "r") as f:
+              c = old = f.read()
+          if "ksu_handle_faccessat" in ksu_syms and "ksu_handle_faccessat" not in c:
+              decl = "#ifdef CONFIG_KSU\nextern int ksu_handle_faccessat(int *dfd, const char __user **filename_user, int *mode, int *flags);\n#endif\n\n"
+              c = re.sub(r'(long do_faccessat\()', decl + r'\1', c, count=1)
+              c = re.sub(r'(long do_faccessat\([^{]+\{[^\n]*\n(?:[ \t]+[^\n]*;[ \t]*\n)+)',
+                         r'\1#ifdef CONFIG_KSU\n\tksu_handle_faccessat(&dfd, &filename, &mode, NULL);\n#endif\n', c, count=1)
+              save_if_changed("fs/open.c", old, c, "ksu_handle_faccessat")
+
+          # 6. fs/stat.c -> ksu_handle_stat + newfstat_ret + fstat64_ret
+          with open("fs/stat.c", "r") as f:
+              c = old = f.read()
+          if "ksu_handle_stat" in ksu_syms and "ksu_handle_stat" not in c:
+              decl = "#ifdef CONFIG_KSU\nstruct stat;\nstruct stat64;\nextern int ksu_handle_stat(int *dfd, const char __user **filename_user, int *flags);\n"
+              if "ksu_handle_newfstat_ret" in ksu_syms:
+                  decl += "extern void ksu_handle_newfstat_ret(unsigned int *fd, struct stat __user **statbuf_ptr);\n"
+              if "ksu_handle_fstat64_ret" in ksu_syms:
+                  decl += "extern void ksu_handle_fstat64_ret(unsigned long *fd, struct stat64 __user **statbuf_ptr);\n"
+              decl += "#endif\n\n"
+
+              c = re.sub(r'(int vfs_statx\()', decl + r'\1', c, count=1)
+              c = re.sub(r'(int vfs_statx\([^{]+\{[^\n]*\n(?:[ \t]+[^\n]*;[ \t]*\n)+)',
+                         r'\1#ifdef CONFIG_KSU\n\tksu_handle_stat(&dfd, &filename, &flags);\n#endif\n', c, count=1)
+
+              if "ksu_handle_newfstat_ret" in ksu_syms:
+                  c = re.sub(r'(vfs_fstat\(fd,\s*&stat\);\s*if\s*\(!error\)\s*error\s*=\s*cp_new_stat\(&stat,\s*statbuf\);)',
+                             r'\1\n#ifdef CONFIG_KSU\n\tksu_handle_newfstat_ret(&fd, &statbuf);\n#endif', c, count=1)
+              if "ksu_handle_fstat64_ret" in ksu_syms:
+                  c = re.sub(r'(vfs_fstat\(fd,\s*&stat\);\s*if\s*\(!error\)\s*error\s*=\s*cp_new_stat64\(&stat,\s*statbuf\);)',
+                             r'\1\n#ifdef CONFIG_KSU\n\tksu_handle_fstat64_ret(&fd, &statbuf);\n#endif', c, count=1)
+
+              save_if_changed("fs/stat.c", old, c, "ksu_handle_stat + newfstat_ret + fstat64_ret")
+
+          # 7. fs/read_write.c -> ksu_handle_sys_read
+          with open("fs/read_write.c", "r") as f:
+              c = old = f.read()
+          if "ksu_handle_sys_read" not in c:
+              decl = "#ifdef CONFIG_KSU\nextern int ksu_handle_sys_read(unsigned int fd, char __user **buf_ptr, size_t *count_ptr);\n#endif\n\n"
+              c = re.sub(r'(SYSCALL_DEFINE3\(read,)', decl + r'\1', c, count=1)
+              c = re.sub(r'(SYSCALL_DEFINE3\(read,[^{]+\{[^\n]*\n(?:[ \t]+[^\n]*;[ \t]*\n)+)',
+                         r'\1#ifdef CONFIG_KSU\n\tksu_handle_sys_read(fd, &buf, &count);\n#endif\n', c, count=1)
+              save_if_changed("fs/read_write.c", old, c, "ksu_handle_sys_read")
+          PYEOF
+
+          # SuSFS in die Kernel-Config schreiben
+          DEFCONFIG=$(find arch/arm64/configs -name "redbull_defconfig" | head -n 1)
+          printf '%s\n' \
+            "CONFIG_KSU=y" \
+            "CONFIG_KSU_MANUAL_HOOK=y" \
+            "CONFIG_KSU_MULTI_MANAGER_SUPPORT=y" \
+            "CONFIG_KSU_SUSFS=y" \
+            "CONFIG_KSU_SUSFS_SUS_PATH=y" \
+            "CONFIG_KSU_SUSFS_SUS_MOUNT=y" \
+            "CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT=y" \
+            "CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT=y" \
+            "CONFIG_KSU_SUSFS_SUS_KSTAT=y" \
+            "CONFIG_KSU_SUSFS_SUS_OVERLAYFS=y" \
+            "CONFIG_KSU_SUSFS_TRY_UMOUNT=y" \
+            "CONFIG_KSU_SUSFS_SPOOF_UNAME=y" \
+            "CONFIG_KSU_SUSFS_ENABLE_LOG=y" \
+            "CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y" \
+            "CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y" \
+            "CONFIG_KSU_SUSFS_OPEN_REDIRECT=y" \
+            "CONFIG_KALLSYMS=y" \
+            "CONFIG_KALLSYMS_ALL=y" >> "$DEFCONFIG"
+
+          git config user.email "builder@local"
+          git config user.name "builder"
+          git add -A
+          git commit -m "Integrate BakaSU and SuSFS 4.19" || true
+
+      - name: Compile Kernel (Image.lz4)
+        run: |
+          set -o pipefail
+          cd work/kernel
+          export PATH="$GITHUB_WORKSPACE/work/clang/bin:$PATH"
+          DEFCONFIG=$(find arch/arm64/configs -name "redbull_defconfig" | head -n 1)
+          DEFCONFIG_REL=${DEFCONFIG#arch/arm64/configs/}
+
+          make -j$(nproc) O=out ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 \
+            CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
+            "$DEFCONFIG_REL"
+
+          ./scripts/config --file out/.config \
+            -e KSU \
+            -e KSU_MANUAL_HOOK \
+            -e KSU_MULTI_MANAGER_SUPPORT \
+            -e KSU_SUSFS \
+            -e KSU_SUSFS_SUS_PATH \
+            -e KSU_SUSFS_SUS_MOUNT \
+            -e KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT \
+            -e KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT \
+            -e KSU_SUSFS_SUS_KSTAT \
+            -e KSU_SUSFS_SUS_OVERLAYFS \
+            -e KSU_SUSFS_TRY_UMOUNT \
+            -e KSU_SUSFS_SPOOF_UNAME \
+            -e KSU_SUSFS_ENABLE_LOG \
+            -e KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS \
+            -e KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG \
+            -e KSU_SUSFS_OPEN_REDIRECT
+          make -j$(nproc) O=out ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 \
+            CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
+            olddefconfig
+
+          echo "=== Aktive SuSFS- & BakaSU-Konfiguration ==="
+          grep -E "CONFIG_KSU_SUSFS|CONFIG_KSU_MANUAL_HOOK" out/.config || true
+
+          if ! make -j$(nproc) O=out ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 \
+            CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
+            KCFLAGS="-Wno-error" DTC_FLAGS="-f" Image.lz4 2>&1 | tee build.log; then
+            echo "=== FEHLER IM BUILD-LOG ==="
+            grep -iE "error:|ERROR \(|undefined reference|fatal error|No rule to make" build.log | tail -n 30
+            exit 1
+          fi
+
+      - name: Package AnyKernel3
+        run: |
+          cd work
+          for img in Image.lz4-dtb Image.lz4 Image.gz-dtb Image.gz Image; do
+            if [ -f "kernel/out/arch/arm64/boot/$img" ]; then
+              cp "kernel/out/arch/arm64/boot/$img" AnyKernel3/
+              break
+            fi
+          done
+
+          cd AnyKernel3
+          sed -i 's/device.name1=maguro/device.name1=bramble/' anykernel.sh
+          sed -i 's/device.name2=toro/device.name2=redfin/' anykernel.sh
+          sed -i 's|BLOCK=.*;|BLOCK=/dev/block/bootdevice/by-name/boot;|' anykernel.sh
+          sed -i 's/IS_SLOT_DEVICE=0;/IS_SLOT_DEVICE=1;/' anykernel.sh
+          zip -r9 "$GITHUB_WORKSPACE/BakaSU-SuSFS-bramble.zip" * -x .git README.md *placeholder
+
+      - name: Upload Kernel ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: BakaSU-SuSFS-bramble
+          path: BakaSU-SuSFS-bramble.zip
