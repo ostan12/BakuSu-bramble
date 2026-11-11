@@ -46,7 +46,7 @@ jobs:
           [ -f drivers/kernelsu/kernel_includes.h ] && sed -i 's|#include <linux/static_call.h>|/* disabled on 4.19 */|g' drivers/kernelsu/kernel_includes.h
           [ -f drivers/kernelsu/extension/cpu_spoof.c ] && sed -i 's/->vdso_clock_mode/->rating/g' drivers/kernelsu/extension/cpu_spoof.c
 
-          # 5. Python-Patcher: Löst SuSFS-Rejects auf & setzt alle geforderten Inline-Hooks
+          # 5. Python-Patcher: Löst SuSFS-Rejects auf & setzt alle 7 Inline-Hooks
           python3 - << 'PYEOF'
           import re, subprocess
 
@@ -70,65 +70,46 @@ jobs:
                          r'\1\n#ifdef CONFIG_KSU_SUSFS\n\tu64 susfs_mnt_id_backup;\n#endif', c, count=1)
               save_if_changed("include/linux/mount.h", old, c, "susfs_mnt_id_backup")
 
-          # --- B. SuSFS Rejects in fs/namespace.c (Deklarationen + Aufrufe) ---
+          # --- B. SuSFS Konstanten in fs/pnode.h ---
+          with open("fs/pnode.h", "r") as f:
+              c = old = f.read()
+          if "CL_COPY_MNT_NS" not in c:
+              c += "\n#ifndef CL_COPY_MNT_NS\n#define CL_COPY_MNT_NS 0x100\n#endif\n#ifndef CL_ZYGOTE_COPY_MNT_NS\n#define CL_ZYGOTE_COPY_MNT_NS 0x200\n#endif\n"
+              save_if_changed("fs/pnode.h", old, c, "CL_COPY_MNT_NS in fs/pnode.h")
+
+          # --- C. SuSFS Rejects in fs/namespace.c ---
           with open("fs/namespace.c", "r") as f:
               c = old = f.read()
 
-          ns_defs = """
-#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
-#include <linux/susfs.h>
-extern bool susfs_is_current_zygote_domain(void);
-extern struct ida susfs_mnt_id_ida;
-extern struct ida susfs_mnt_group_ida;
-#ifndef DEFAULT_SUS_MNT_ID
-#define DEFAULT_SUS_MNT_ID 100000
-#endif
-#ifndef DEFAULT_SUS_MNT_GROUP_ID
-#define DEFAULT_SUS_MNT_GROUP_ID 100000
-#endif
-#ifndef DEFAULT_SUS_MNT_ID_FOR_KSU_PROC_UNSHARE
-#define DEFAULT_SUS_MNT_ID_FOR_KSU_PROC_UNSHARE 1000000
-#endif
-#ifndef CL_COPY_MNT_NS
-#define CL_COPY_MNT_NS 0x20
-#endif
-#ifndef CL_ZYGOTE_COPY_MNT_NS
-#define CL_ZYGOTE_COPY_MNT_NS 0x40
-#endif
-#endif
-"""
+          ns_top = (
+              "#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\n"
+              "#include <linux/susfs.h>\n"
+              "static DEFINE_IDA(susfs_mnt_id_ida);\n"
+              "static DEFINE_IDA(susfs_mnt_group_ida);\n"
+              "#endif\n"
+              "static DEFINE_IDA(mnt_id_ida);"
+          )
           if "susfs_mnt_id_ida" not in c:
-              c = re.sub(r'(#include\s*<[^>]+>\n)', r'\1' + ns_defs, c, count=1)
+              c = c.replace("static DEFINE_IDA(mnt_id_ida);", ns_top, 1)
 
-          # Punktgenaue Anpassung in alloc_vfsmnt
-          alloc_pos = c.find("alloc_vfsmnt(")
-          if alloc_pos != -1:
-              alloc_call = c.find("err = mnt_alloc_id(mnt);", alloc_pos)
-              if alloc_call != -1 and alloc_call - alloc_pos < 1500:
-                  c = c[:alloc_call] + "#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\n\terr = mnt_alloc_id(mnt, false, false);\n#else\n\terr = mnt_alloc_id(mnt);\n#endif" + c[alloc_call + len("err = mnt_alloc_id(mnt);"):]
+          # mnt_alloc_id Aufrufe in alloc_vfsmnt und clone_mnt anpassen
+          c = re.sub(r'(static struct mount \*alloc_vfsmnt\([^{]+\{[\s\S]*?)(err\s*=\s*mnt_alloc_id\(mnt\);)',
+                     r'\1#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\n\terr = mnt_alloc_id(mnt, false, false);\n#else\n\terr = mnt_alloc_id(mnt);\n#endif', c, count=1)
 
-          # Punktgenaue Anpassung in clone_mnt
-          clone_pos = c.find("clone_mnt(")
-          if clone_pos != -1:
-              clone_call = c.find("err = mnt_alloc_id(mnt);", clone_pos)
-              if clone_call != -1 and clone_call - clone_pos < 2500:
-                  c = c[:clone_call] + "#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\n\terr = mnt_alloc_id(mnt, (flag & CL_COPY_MNT_NS) ? true : false, (flag & CL_ZYGOTE_COPY_MNT_NS) ? true : false);\n#else\n\terr = mnt_alloc_id(mnt);\n#endif" + c[clone_call + len("err = mnt_alloc_id(mnt);"):]
+          c = re.sub(r'(struct mount \*clone_mnt\([^{]+\{[\s\S]*?)(err\s*=\s*mnt_alloc_id\(mnt\);)',
+                     r'\1#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\n\terr = mnt_alloc_id(mnt, (flag & CL_COPY_MNT_NS) ? true : false, (flag & CL_ZYGOTE_COPY_MNT_NS) ? true : false);\n#else\n\terr = mnt_alloc_id(mnt);\n#endif', c, count=1)
 
-          save_if_changed("fs/namespace.c", old, c, "SuSFS namespace definitions and calls")
+          save_if_changed("fs/namespace.c", old, c, "SuSFS namespace fixes")
 
-          # --- C. BakaSU Hooks ---
+          # --- D. Die 7 BakaSU Pflicht-Hooks ---
 
-          # 1. drivers/input/input.c -> ksu_handle_input_handle_event (Löst Fehler inline_hook_check.mk:58)
+          # 1. drivers/input/input.c -> ksu_handle_input_handle_event
           with open("drivers/input/input.c", "r") as f:
               c = old = f.read()
           if "ksu_handle_input_handle_event" not in c:
-              has_input_flag = "ksu_input_hook" in ksu_syms
-              decl = "#ifdef CONFIG_KSU\n"
-              if has_input_flag:
-                  decl += "extern bool ksu_input_hook __read_mostly;\n"
-              decl += "extern int ksu_handle_input_handle_event(unsigned int *type, unsigned int *code, int *value);\n#endif\n\n"
+              decl = "#ifdef CONFIG_KSU\nextern bool ksu_input_hook __read_mostly;\nextern int ksu_handle_input_handle_event(unsigned int *type, unsigned int *code, int *value);\n#endif\n\n"
               c = re.sub(r'(#include\s*[<"][^>"]+[>"]\n)', r'\1' + decl, c, count=1)
-              hook = "#ifdef CONFIG_KSU\n\tif (unlikely(ksu_input_hook))\n\t\tksu_handle_input_handle_event(&type, &code, &value);\n#endif\n" if has_input_flag else "#ifdef CONFIG_KSU\n\tksu_handle_input_handle_event(&type, &code, &value);\n#endif\n"
+              hook = "#ifdef CONFIG_KSU\n\tif (unlikely(ksu_input_hook))\n\t\tksu_handle_input_handle_event(&type, &code, &value);\n#endif\n"
               c = re.sub(r'(static void input_handle_event\([^{]+\{\n)', r'\1' + hook, c, count=1)
               save_if_changed("drivers/input/input.c", old, c, "ksu_handle_input_handle_event")
 
@@ -204,10 +185,10 @@ extern struct ida susfs_mnt_group_ida;
               c = re.sub(r'(SYSCALL_DEFINE3\(read,)', decl + r'\1', c, count=1)
               c = re.sub(r'(SYSCALL_DEFINE3\(read,[^{]+\{[^\n]*\n(?:[ \t]+[^\n]*;[ \t]*\n)+)',
                          r'\1#ifdef CONFIG_KSU\n\tksu_handle_sys_read(fd, &buf, &count);\n#endif\n', c, count=1)
-              save_if_changed("fs/read_write.c", old, c, "ksu_handle_sys_read in SYSCALL_DEFINE3(read)")
+              save_if_changed("fs/read_write.c", old, c, "ksu_handle_sys_read")
           PYEOF
 
-          # Defconfig für BakaSU + SuSFS
+          # Defconfig vorbereiten
           DEFCONFIG=$(find arch/arm64/configs -name "redbull_defconfig" | head -n 1)
           printf '%s\n' \
             "CONFIG_KSU=y" \
@@ -232,7 +213,7 @@ extern struct ida susfs_mnt_group_ida;
           git config user.email "builder@local"
           git config user.name "builder"
           git add -A
-          git commit -m "Integrate BakaSU and SuSFS 4.19 with input hook" || true
+          git commit -m "Integrate BakaSU and SuSFS 4.19 with all hooks" || true
 
       - name: Compile Kernel (Image.lz4)
         run: |
