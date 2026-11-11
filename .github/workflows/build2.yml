@@ -15,8 +15,15 @@ jobs:
       - name: Free up disk space & install dependencies
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
-          sudo apt-get update
-          sudo apt-get install -y bc bison flex libssl-dev make zip unzip python3 cpio libelf-dev dwarves git curl lz4 patch gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi
+
+          # DNS- und Mirror-Fix gegen 'Temporary failure resolving azure.archive.ubuntu.com'
+          echo -e "nameserver 1.1.1.1\nnameserver 8.8.8.8" | sudo tee /etc/resolv.conf > /dev/null
+          sudo sed -i 's|azure.archive.ubuntu.com|archive.ubuntu.com|g' /etc/apt/apt-mirrors.txt 2>/dev/null || true
+          sudo sed -i 's|mirror+file:/etc/apt/apt-mirrors.txt|http://archive.ubuntu.com/ubuntu|g' /etc/apt/sources.list.d/ubuntu.sources 2>/dev/null || true
+          sudo sed -i 's|azure.archive.ubuntu.com|archive.ubuntu.com|g' /etc/apt/sources.list 2>/dev/null || true
+
+          for i in 1 2 3; do sudo apt-get update && break || sleep 5; done
+          sudo apt-get install -y --fix-missing bc bison flex libssl-dev make zip unzip python3 cpio libelf-dev dwarves git curl lz4 patch gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi
 
       - name: Clone LineageOS redbull kernel, Toolchain & SuSFS
         run: |
@@ -46,54 +53,77 @@ jobs:
           [ -f drivers/kernelsu/kernel_includes.h ] && sed -i 's|#include <linux/static_call.h>|/* disabled on 4.19 */|g' drivers/kernelsu/kernel_includes.h
           [ -f drivers/kernelsu/extension/cpu_spoof.c ] && sed -i 's/->vdso_clock_mode/->rating/g' drivers/kernelsu/extension/cpu_spoof.c
 
-          # 5. Python-Patcher: Löst alle Rejects und Dispatch-Stubs sauber auf
+          # 5. Python-Patcher: Löst Rejects und Makro-Fehler auf
           python3 - << 'PYEOF'
-          import re, subprocess, os
+          import re, os, subprocess
 
-          # --- A. SuSFS v1.5.5 Makros in dispatch.c injizieren ---
-          disp_stub = (
-              "#ifndef CMD_SUSFS_STUB_INJECTED\n"
-              "#define CMD_SUSFS_STUB_INJECTED 1\n"
-              "#ifndef CMD_SUSFS_ADD_SUS_PATH_LOOP\n#define CMD_SUSFS_ADD_SUS_PATH_LOOP 0x55568\n#endif\n"
-              "#ifndef CMD_SUSFS_HIDE_SUS_MNTS_FOR_NON_SU_PROCS\n#define CMD_SUSFS_HIDE_SUS_MNTS_FOR_NON_SU_PROCS 0x5556c\n#endif\n"
-              "#ifndef CMD_SUSFS_ADD_SUS_MAP\n#define CMD_SUSFS_ADD_SUS_MAP 0x55566\n#endif\n"
-              "#ifndef CMD_SUSFS_ENABLE_AVC_LOG_SPOOFING\n#define CMD_SUSFS_ENABLE_AVC_LOG_SPOOFING 0x5556a\n#endif\n"
-              "struct st_susfs_sus_path_loop { char dummy[256]; };\n"
-              "struct st_susfs_sus_map { char dummy[256]; };\n"
-              "static inline int susfs_add_sus_path_loop(void *a) { return 0; }\n"
-              "static inline int susfs_hide_sus_mnts_for_non_su_procs(void *a) { return 0; }\n"
-              "static inline int susfs_add_sus_map(void *a) { return 0; }\n"
-              "static inline int susfs_enable_avc_log_spoofing(void *a) { return 0; }\n"
-              "#endif\n"
-          )
+          # --- A. include/linux/susfs.h ergänzen ---
+          susfs_h = "include/linux/susfs.h"
+          if os.path.exists(susfs_h):
+              with open(susfs_h, "r") as f:
+                  sh = f.read()
+              extra_susfs = (
+                  "\n#ifndef SUSFS_MAGIC\n#define SUSFS_MAGIC 0x55534653\n#endif\n"
+                  "#ifndef DEFAULT_SUS_MNT_ID\n#define DEFAULT_SUS_MNT_ID 100000\n#endif\n"
+                  "#ifndef DEFAULT_SUS_MNT_GROUP_ID\n#define DEFAULT_SUS_MNT_GROUP_ID 1000\n#endif\n"
+                  "#ifndef DEFAULT_SUS_MNT_ID_FOR_KSU_PROC_UNSHARE\n#define DEFAULT_SUS_MNT_ID_FOR_KSU_PROC_UNSHARE 1000000\n#endif\n"
+                  "#ifndef CL_COPY_MNT_NS\n#define CL_COPY_MNT_NS 0x20\n#endif\n"
+                  "#ifndef CL_ZYGOTE_COPY_MNT_NS\n#define CL_ZYGOTE_COPY_MNT_NS 0x40\n#endif\n"
+                  "#ifndef CMD_SUSFS_ADD_SUS_PATH_LOOP\n#define CMD_SUSFS_ADD_SUS_PATH_LOOP 0x55568\n#endif\n"
+                  "#ifndef CMD_SUSFS_HIDE_SUS_MNTS_FOR_NON_SU_PROCS\n#define CMD_SUSFS_HIDE_SUS_MNTS_FOR_NON_SU_PROCS 0x5556c\n#endif\n"
+                  "#ifndef CMD_SUSFS_ADD_SUS_MAP\n#define CMD_SUSFS_ADD_SUS_MAP 0x55566\n#endif\n"
+                  "#ifndef CMD_SUSFS_ENABLE_AVC_LOG_SPOOFING\n#define CMD_SUSFS_ENABLE_AVC_LOG_SPOOFING 0x5556a\n#endif\n"
+                  "struct st_susfs_sus_path_loop;\n"
+                  "struct st_susfs_sus_map;\n"
+                  "#define susfs_add_sus_path_loop(...) (0)\n"
+                  "#define susfs_hide_sus_mnts_for_non_su_procs(...) (0)\n"
+                  "#define susfs_add_sus_map(...) (0)\n"
+                  "#define susfs_enable_avc_log_spoofing(...) (0)\n"
+              )
+              if "CMD_SUSFS_ADD_SUS_PATH_LOOP" not in sh:
+                  with open(susfs_h, "w") as f:
+                      f.write(extra_susfs + sh)
+                  print("[OK] include/linux/susfs.h ergänzt")
+
+          # --- B. dispatch.c Stubs einfügen ---
           for root, dirs, files in os.walk("."):
               if "dispatch.c" in files:
                   fp = os.path.join(root, "dispatch.c")
                   with open(fp, "r") as f:
                       txt = f.read()
-                  if "CMD_SUSFS_STUB_INJECTED" not in txt:
+                  if "BTI_DISP_STUBS" not in txt:
+                      disp_stub = (
+                          "#ifndef BTI_DISP_STUBS\n#define BTI_DISP_STUBS 1\n"
+                          "#include <linux/susfs.h>\n"
+                          "#ifndef CMD_SUSFS_ADD_SUS_PATH_LOOP\n#define CMD_SUSFS_ADD_SUS_PATH_LOOP 0x55568\n#endif\n"
+                          "#ifndef CMD_SUSFS_HIDE_SUS_MNTS_FOR_NON_SU_PROCS\n#define CMD_SUSFS_HIDE_SUS_MNTS_FOR_NON_SU_PROCS 0x5556c\n#endif\n"
+                          "#ifndef CMD_SUSFS_ADD_SUS_MAP\n#define CMD_SUSFS_ADD_SUS_MAP 0x55566\n#endif\n"
+                          "#ifndef CMD_SUSFS_ENABLE_AVC_LOG_SPOOFING\n#define CMD_SUSFS_ENABLE_AVC_LOG_SPOOFING 0x5556a\n#endif\n"
+                          "struct st_susfs_sus_path_loop;\n"
+                          "struct st_susfs_sus_map;\n"
+                          "#define susfs_add_sus_path_loop(...) (0)\n"
+                          "#define susfs_hide_sus_mnts_for_non_su_procs(...) (0)\n"
+                          "#define susfs_add_sus_map(...) (0)\n"
+                          "#define susfs_enable_avc_log_spoofing(...) (0)\n"
+                          "#endif\n"
+                      )
                       with open(fp, "w") as f:
                           f.write(disp_stub + txt)
                       print(f"[OK] {fp} gepatcht")
 
-          # --- B. supercall.c mit SUSFS_MAGIC versorgen ---
-          sc_stub = (
-              "#ifndef SUSFS_MAGIC_INJECTED\n"
-              "#define SUSFS_MAGIC_INJECTED 1\n"
-              "#ifndef SUSFS_MAGIC\n#define SUSFS_MAGIC 0x55534653\n#endif\n"
-              "#endif\n"
-          )
+          # --- C. supercall.c mit SUSFS_MAGIC versorgen ---
           for root, dirs, files in os.walk("."):
               if "supercall.c" in files:
                   fp = os.path.join(root, "supercall.c")
                   with open(fp, "r") as f:
                       txt = f.read()
-                  if "SUSFS_MAGIC_INJECTED" not in txt:
+                  if "SUSFS_MAGIC" not in txt or "#define SUSFS_MAGIC" not in txt:
+                      txt = "#ifndef SUSFS_MAGIC\n#define SUSFS_MAGIC 0x55534653\n#endif\n" + txt
                       with open(fp, "w") as f:
-                          f.write(sc_stub + txt)
+                          f.write(txt)
                       print(f"[OK] {fp} gepatcht")
 
-          # --- C. include/linux/mount.h: susfs_mnt_id_backup ---
+          # --- D. include/linux/mount.h: susfs_mnt_id_backup ---
           with open("include/linux/mount.h", "r") as f:
               mh = f.read()
           if "susfs_mnt_id_backup" not in mh:
@@ -103,45 +133,51 @@ jobs:
                   f.write(mh)
               print("[OK] include/linux/mount.h gepatcht")
 
-          # --- D. fs/namespace.c: Hunk 1, 7, 9, 10 Rejects auflösen ---
+          # --- E. fs/pnode.h: CL_COPY_MNT_NS Konstanten ---
+          with open("fs/pnode.h", "r") as f:
+              pnh = f.read()
+          if "CL_COPY_MNT_NS" not in pnh:
+              pnh += "\n#ifndef CL_COPY_MNT_NS\n#define CL_COPY_MNT_NS 0x20\n#endif\n#ifndef CL_ZYGOTE_COPY_MNT_NS\n#define CL_ZYGOTE_COPY_MNT_NS 0x40\n#endif\n"
+              with open("fs/pnode.h", "w") as f:
+                  f.write(pnh)
+              print("[OK] fs/pnode.h gepatcht")
+
+          # --- F. fs/namespace.c Rejects auflösen ---
           with open("fs/namespace.c", "r") as f:
               ns = f.read()
 
-          # Hunk 1: Header und IDA-Definitionen hinter dem letzten #include einfügen
-          if "DEFINE_IDA(susfs_mnt_id_ida);" not in ns:
-              last_inc = 0
-              for m in re.finditer(r'^#include\s*[<"][^>"]+[>"].*$', ns, flags=re.MULTILINE):
-                  last_inc = m.end()
-              hunk1_code = (
-                  "\n#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\n"
-                  "#include <linux/susfs.h>\n"
-                  "extern bool susfs_is_current_zygote_domain(void);\n"
-                  "DEFINE_IDA(susfs_mnt_id_ida);\n"
-                  "DEFINE_IDA(susfs_mnt_group_ida);\n"
-                  "#ifndef DEFAULT_SUS_MNT_ID\n#define DEFAULT_SUS_MNT_ID 100000\n#endif\n"
-                  "#ifndef DEFAULT_SUS_MNT_GROUP_ID\n#define DEFAULT_SUS_MNT_GROUP_ID 1000\n#endif\n"
-                  "#ifndef DEFAULT_SUS_MNT_ID_FOR_KSU_PROC_UNSHARE\n#define DEFAULT_SUS_MNT_ID_FOR_KSU_PROC_UNSHARE 1000000\n#endif\n"
-                  "#ifndef CL_COPY_MNT_NS\n#define CL_COPY_MNT_NS 0x20\n#endif\n"
-                  "#ifndef CL_ZYGOTE_COPY_MNT_NS\n#define CL_ZYGOTE_COPY_MNT_NS 0x40\n#endif\n"
-                  "#endif\n"
-              )
-              ns = ns[:last_inc] + hunk1_code + ns[last_inc:]
+          # Hunk 1 fix: SuSFS Deklarationen ganz oben einfügen
+          hunk1 = (
+              "\n#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\n"
+              "#include <linux/susfs.h>\n"
+              "extern bool susfs_is_current_zygote_domain(void);\n"
+              "extern struct ida susfs_mnt_id_ida;\n"
+              "extern struct ida susfs_mnt_group_ida;\n"
+              "#ifndef DEFAULT_SUS_MNT_ID\n#define DEFAULT_SUS_MNT_ID 100000\n#endif\n"
+              "#ifndef DEFAULT_SUS_MNT_GROUP_ID\n#define DEFAULT_SUS_MNT_GROUP_ID 1000\n#endif\n"
+              "#ifndef DEFAULT_SUS_MNT_ID_FOR_KSU_PROC_UNSHARE\n#define DEFAULT_SUS_MNT_ID_FOR_KSU_PROC_UNSHARE 1000000\n#endif\n"
+              "#ifndef CL_COPY_MNT_NS\n#define CL_COPY_MNT_NS 0x20\n#endif\n"
+              "#ifndef CL_ZYGOTE_COPY_MNT_NS\n#define CL_ZYGOTE_COPY_MNT_NS 0x40\n#endif\n"
+              "#endif\n"
+          )
+          if "extern struct ida susfs_mnt_id_ida;" not in ns:
+              ns = hunk1 + ns
 
-          # Hunk 7: alloc_vfsmnt in vfs_kern_mount (ganze Anweisung ersetzen)
+          # Hunk 7 fix: vfs_kern_mount ruft alloc_vfsmnt mit 3 Argumenten auf
           ns = re.sub(
-              r'mnt\s*=\s*alloc_vfsmnt\((fc->source \?: "none"|name)\);',
-              r'mnt = alloc_vfsmnt(\1, false, 0);',
+              r'alloc_vfsmnt\((fc->source \?: "none"|name)\)',
+              r'alloc_vfsmnt(\1, false, 0)',
               ns
           )
 
-          # Hunk 9: alloc_vfsmnt in clone_mnt (ganze Anweisung ersetzen)
+          # Hunk 9 fix: clone_mnt ruft alloc_vfsmnt mit 3 Argumenten auf
           ns = re.sub(
-              r'mnt\s*=\s*alloc_vfsmnt\(old->mnt_devname\);',
-              r'mnt = alloc_vfsmnt(old->mnt_devname, (flag & CL_COPY_MNT_NS) ? true : false, (flag & CL_ZYGOTE_COPY_MNT_NS) ? DEFAULT_SUS_MNT_ID_FOR_KSU_PROC_UNSHARE : 0);',
+              r'alloc_vfsmnt\(old->mnt_devname\)',
+              r'alloc_vfsmnt(old->mnt_devname, (flag & CL_COPY_MNT_NS) ? true : false, (flag & CL_ZYGOTE_COPY_MNT_NS) ? DEFAULT_SUS_MNT_ID_FOR_KSU_PROC_UNSHARE : 0)',
               ns
           )
 
-          # Hunk 10: susfs_mnt_id_backup in clone_mnt kopieren
+          # Hunk 10 fix: susfs_mnt_id_backup kopieren
           if "mnt->mnt.susfs_mnt_id_backup = old->mnt.susfs_mnt_id_backup;" not in ns:
               ns = re.sub(
                   r'(mnt->mnt\.mnt_flags\s*=\s*old->mnt\.mnt_flags;)',
@@ -153,16 +189,21 @@ jobs:
               f.write(ns)
           print("[OK] fs/namespace.c gepatcht")
 
-          # --- E. Die 7 BakaSU Pflicht-Hooks ---
+          # --- G. Die 7 BakaSU Pflicht-Hooks ---
           # 1. drivers/input/input.c (ohne C99-Declaration-Warning)
           with open("drivers/input/input.c", "r") as f:
               inp = f.read()
-          disp_stmt = "int disposition = input_get_disposition(dev, type, code, &value);"
-          if disp_stmt in inp and "ksu_handle_input_handle_event" not in inp:
-              decl = "#ifdef CONFIG_KSU\nextern int ksu_handle_input_handle_event(unsigned int *type, unsigned int *code, int *value);\n#endif\n"
-              pos = inp.find("static void input_handle_event(")
-              hook = "\n#ifdef CONFIG_KSU\n\tksu_handle_input_handle_event(&type, &code, &value);\n#endif"
-              inp = inp[:pos] + decl + inp[pos:].replace(disp_stmt, disp_stmt + hook, 1)
+          if "ksu_handle_input_handle_event" not in inp:
+              inp = "#ifdef CONFIG_KSU\nextern int ksu_handle_input_handle_event(unsigned int *type, unsigned int *code, int *value);\n#endif\n" + inp
+              target_disp = "int disposition = input_get_disposition(dev, type, code, &value);"
+              hook_disp = (
+                  "\tint disposition;\n"
+                  "#ifdef CONFIG_KSU\n"
+                  "\tksu_handle_input_handle_event(&type, &code, &value);\n"
+                  "#endif\n"
+                  "\tdisposition = input_get_disposition(dev, type, code, &value);"
+              )
+              inp = inp.replace(target_disp, hook_disp, 1)
               with open("drivers/input/input.c", "w") as f:
                   f.write(inp)
               print("[OK] drivers/input/input.c gepatcht")
