@@ -44,11 +44,11 @@ jobs:
           # 2. SuSFS 4.19 Basis-Patch anwenden
           patch -p1 --forward < ../susfs4ksu/kernel_patches/50_add_susfs_in_kernel-4.19.patch || true
 
-          # 3. susfs.o fest in fs/Makefile verdrahten (garantiert das Kompilieren von fs/susfs.c)
+          # 3. ZWINGEND susfs.o in fs/Makefile fest verdrahten
           sed -i '/susfs/d' fs/Makefile
           echo "obj-y += susfs.o" >> fs/Makefile
 
-          # 4. In fs/susfs.c sicherstellen, dass alle Features aktiviert sind
+          # 4. In fs/susfs.c sicherstellen, dass alle Config-Flags aktiv sind
           if [ -f fs/susfs.c ]; then
             sed -i '1i #ifndef CONFIG_KSU_SUSFS\n#define CONFIG_KSU_SUSFS 1\n#endif\n#ifndef CONFIG_SUSFS\n#define CONFIG_SUSFS 1\n#endif\n#ifndef CONFIG_KSU_SUSFS_SUS_MOUNT\n#define CONFIG_KSU_SUSFS_SUS_MOUNT 1\n#endif' fs/susfs.c
           fi
@@ -61,17 +61,18 @@ jobs:
           [ -f drivers/kernelsu/kernel_includes.h ] && sed -i 's|#include <linux/static_call.h>|/* disabled on 4.19 */|g' drivers/kernelsu/kernel_includes.h
           [ -f drivers/kernelsu/extension/cpu_spoof.c ] && sed -i 's/->vdso_clock_mode/->rating/g' drivers/kernelsu/extension/cpu_spoof.c
 
-          # 7. Python-Patcher: Löst alle Rejects, Hooks und IDA-Definitionen auf
+          # 7. Python-Patcher: Löst alle Rejects und Hooks fehlerfrei auf
           python3 - << 'PYEOF'
           import re, os, subprocess
 
-          # --- A. include/linux/susfs.h ergänzen ---
+          # --- A. include/linux/susfs.h ergänzen (inkl. IDR Header & Forward-Decls) ---
           susfs_h = "include/linux/susfs.h"
           if os.path.exists(susfs_h):
               with open(susfs_h, "r") as f:
                   sh = f.read()
               extra_susfs = (
-                  "\n#ifndef SUSFS_MAGIC\n#define SUSFS_MAGIC 0x55534653\n#endif\n"
+                  "\n#include <linux/idr.h>\n"
+                  "#ifndef SUSFS_MAGIC\n#define SUSFS_MAGIC 0x55534653\n#endif\n"
                   "#ifndef DEFAULT_SUS_MNT_ID\n#define DEFAULT_SUS_MNT_ID 100000\n#endif\n"
                   "#ifndef DEFAULT_SUS_MNT_GROUP_ID\n#define DEFAULT_SUS_MNT_GROUP_ID 1000\n#endif\n"
                   "#ifndef DEFAULT_SUS_MNT_ID_FOR_KSU_PROC_UNSHARE\n#define DEFAULT_SUS_MNT_ID_FOR_KSU_PROC_UNSHARE 1000000\n#endif\n"
@@ -94,7 +95,21 @@ jobs:
                       f.write(extra_susfs + sh)
                   print("[OK] include/linux/susfs.h ergänzt")
 
-          # --- B. dispatch.c Stubs & Dereferenzierung ---
+          # --- B. Prüfen, ob fs/susfs.c die IDAs definiert ---
+          has_susfs_c_ida = False
+          if os.path.exists("fs/susfs.c"):
+              with open("fs/susfs.c", "r") as f:
+                  sc_txt = f.read()
+              if "susfs_mnt_id_ida" in sc_txt:
+                  has_susfs_c_ida = True
+                  # Sicherstellen, dass die IDAs global (ohne static) sind
+                  sc_txt = re.sub(r'static\s+DEFINE_IDA\(susfs_mnt_id_ida\);', 'DEFINE_IDA(susfs_mnt_id_ida);', sc_txt)
+                  sc_txt = re.sub(r'static\s+DEFINE_IDA\(susfs_mnt_group_ida\);', 'DEFINE_IDA(susfs_mnt_group_ida);', sc_txt)
+                  with open("fs/susfs.c", "w") as f:
+                      f.write(sc_txt)
+                  print("[OK] fs/susfs.c IDAs auf global gesetzt")
+
+          # --- C. dispatch.c Stubs & Dereferenzierung ---
           for root, dirs, files in os.walk("."):
               if "dispatch.c" in files:
                   fp = os.path.join(root, "dispatch.c")
@@ -117,13 +132,12 @@ jobs:
                           "#endif\n"
                       )
                       txt = disp_stub + txt
-                  # Wandelt susfs_xxx(arg) in susfs_xxx((void *)*arg) um
                   txt = re.sub(r'(susfs_[a-z0-9_]+)\(\s*arg\s*\)', r'\1((void *)*arg)', txt)
                   with open(fp, "w") as f:
                       f.write(txt)
                   print(f"[OK] {fp} gepatcht (Zeiger-Dereferenzierung)")
 
-          # --- C. supercall.c mit SUSFS_MAGIC versorgen ---
+          # --- D. supercall.c mit SUSFS_MAGIC versorgen ---
           for root, dirs, files in os.walk("."):
               if "supercall.c" in files:
                   fp = os.path.join(root, "supercall.c")
@@ -135,7 +149,7 @@ jobs:
                           f.write(txt)
                       print(f"[OK] {fp} gepatcht")
 
-          # --- D. include/linux/mount.h: susfs_mnt_id_backup ---
+          # --- E. include/linux/mount.h: susfs_mnt_id_backup ---
           with open("include/linux/mount.h", "r") as f:
               mh = f.read()
           if "susfs_mnt_id_backup" not in mh:
@@ -145,7 +159,7 @@ jobs:
                   f.write(mh)
               print("[OK] include/linux/mount.h gepatcht")
 
-          # --- E. fs/pnode.h: CL_COPY_MNT_NS Konstanten ---
+          # --- F. fs/pnode.h: CL_COPY_MNT_NS Konstanten ---
           with open("fs/pnode.h", "r") as f:
               pnh = f.read()
           if "CL_COPY_MNT_NS" not in pnh:
@@ -154,45 +168,61 @@ jobs:
                   f.write(pnh)
               print("[OK] fs/pnode.h gepatcht")
 
-          # --- F. fs/namespace.c: IDAs fest definieren (ohne extern) ---
+          # --- G. fs/namespace.c: Sauber am richtigen Ort patchen ---
           with open("fs/namespace.c", "r") as f:
               ns = f.read()
 
-          # Entferne eventuelle fehlerhafte Vorab-Deklarationen
-          ns = re.sub(r'extern struct ida susfs_mnt_id_ida;\n?', '', ns)
-          ns = re.sub(r'extern struct ida susfs_mnt_group_ida;\n?', '', ns)
+          # 1. Eventuell fehlerhafte Einfügungen vom Dateianfang entfernen
+          ns = re.sub(r'^\s*DEFINE_IDA\(susfs_mnt_id_ida\);\s*\n?', '', ns, flags=re.MULTILINE)
+          ns = re.sub(r'^\s*DEFINE_IDA\(susfs_mnt_group_ida\);\s*\n?', '', ns, flags=re.MULTILINE)
+          ns = re.sub(r'^\s*extern struct ida susfs_mnt_id_ida;\s*\n?', '', ns, flags=re.MULTILINE)
+          ns = re.sub(r'^\s*extern struct ida susfs_mnt_group_ida;\s*\n?', '', ns, flags=re.MULTILINE)
 
-          hunk1 = (
-              "\n#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\n"
-              "#include <linux/susfs.h>\n"
-              "extern bool susfs_is_current_zygote_domain(void);\n"
-              "DEFINE_IDA(susfs_mnt_id_ida);\n"
-              "DEFINE_IDA(susfs_mnt_group_ida);\n"
-              "#ifndef DEFAULT_SUS_MNT_ID\n#define DEFAULT_SUS_MNT_ID 100000\n#endif\n"
-              "#ifndef DEFAULT_SUS_MNT_GROUP_ID\n#define DEFAULT_SUS_MNT_GROUP_ID 1000\n#endif\n"
-              "#ifndef DEFAULT_SUS_MNT_ID_FOR_KSU_PROC_UNSHARE\n#define DEFAULT_SUS_MNT_ID_FOR_KSU_PROC_UNSHARE 1000000\n#endif\n"
-              "#ifndef CL_COPY_MNT_NS\n#define CL_COPY_MNT_NS 0x20\n#endif\n"
-              "#ifndef CL_ZYGOTE_COPY_MNT_NS\n#define CL_ZYGOTE_COPY_MNT_NS 0x40\n#endif\n"
-              "#endif\n"
-          )
-          if "DEFINE_IDA(susfs_mnt_id_ida);" not in ns:
-              ns = hunk1 + ns
+          # 2. Header-Include sauber NACH dem letzten #include platzieren
+          if "<linux/susfs.h>" not in ns:
+              last_inc = 0
+              for m in re.finditer(r'^#include\s*[<\"][^>\"]+[>\"].*$', ns, flags=re.MULTILINE):
+                  last_inc = m.end()
+              inc_code = (
+                  "\n#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\n"
+                  "#include <linux/susfs.h>\n"
+                  "extern bool susfs_is_current_zygote_domain(void);\n"
+                  "#ifndef DEFAULT_SUS_MNT_ID\n#define DEFAULT_SUS_MNT_ID 100000\n#endif\n"
+                  "#ifndef DEFAULT_SUS_MNT_GROUP_ID\n#define DEFAULT_SUS_MNT_GROUP_ID 1000\n#endif\n"
+                  "#ifndef DEFAULT_SUS_MNT_ID_FOR_KSU_PROC_UNSHARE\n#define DEFAULT_SUS_MNT_ID_FOR_KSU_PROC_UNSHARE 1000000\n#endif\n"
+                  "#ifndef CL_COPY_MNT_NS\n#define CL_COPY_MNT_NS 0x20\n#endif\n"
+                  "#ifndef CL_ZYGOTE_COPY_MNT_NS\n#define CL_ZYGOTE_COPY_MNT_NS 0x40\n#endif\n"
+                  "#endif\n"
+              )
+              ns = ns[:last_inc] + inc_code + ns[last_inc:]
 
-          # Hunk 7: alloc_vfsmnt
+          # 3. Falls fs/susfs.c keine IDAs hat: Direkt nach static DEFINE_IDA(mnt_group_ida); deklarieren
+          if not has_susfs_c_ida and "DEFINE_IDA(susfs_mnt_id_ida);" not in ns:
+              target_ida = "static DEFINE_IDA(mnt_group_ida);"
+              if target_ida in ns:
+                  ns = ns.replace(
+                      target_ida,
+                      target_ida + "\n#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\nDEFINE_IDA(susfs_mnt_id_ida);\nDEFINE_IDA(susfs_mnt_group_ida);\n#endif"
+                  )
+              else:
+                  # Fallback
+                  ns += "\n#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\nDEFINE_IDA(susfs_mnt_id_ida);\nDEFINE_IDA(susfs_mnt_group_ida);\n#endif\n"
+
+          # 4. Hunk 7: alloc_vfsmnt Aufruf anpassen
           ns = re.sub(
               r'alloc_vfsmnt\((fc->source \?: "none"|name)\)',
               r'alloc_vfsmnt(\1, false, 0)',
               ns
           )
 
-          # Hunk 9: clone_mnt
+          # 5. Hunk 9: clone_mnt alloc_vfsmnt Aufruf anpassen
           ns = re.sub(
               r'alloc_vfsmnt\(old->mnt_devname\)',
               r'alloc_vfsmnt(old->mnt_devname, (flag & CL_COPY_MNT_NS) ? true : false, (flag & CL_ZYGOTE_COPY_MNT_NS) ? DEFAULT_SUS_MNT_ID_FOR_KSU_PROC_UNSHARE : 0)',
               ns
           )
 
-          # Hunk 10: susfs_mnt_id_backup
+          # 6. Hunk 10: susfs_mnt_id_backup kopieren
           if "mnt->mnt.susfs_mnt_id_backup = old->mnt.susfs_mnt_id_backup;" not in ns:
               ns = re.sub(
                   r'(mnt->mnt\.mnt_flags\s*=\s*old->mnt\.mnt_flags;)',
@@ -202,9 +232,9 @@ jobs:
 
           with open("fs/namespace.c", "w") as f:
               f.write(ns)
-          print("[OK] fs/namespace.c gepatcht (IDAs definiert)")
+          print("[OK] fs/namespace.c gepatcht")
 
-          # --- G. Die 7 BakaSU Pflicht-Hooks ---
+          # --- H. Die 7 BakaSU Pflicht-Hooks ---
           # 1. drivers/input/input.c
           with open("drivers/input/input.c", "r") as f:
               inp = f.read()
@@ -271,7 +301,7 @@ jobs:
                   f.write(oc)
               print("[OK] fs/open.c gepatcht")
 
-          # 6. fs/stat.c -> nur ksu_handle_stat (keine newfstat_ret/fstat64_ret)
+          # 6. fs/stat.c -> nur ksu_handle_stat
           with open("fs/stat.c", "r") as f:
               stc = f.read()
           if "ksu_handle_stat" not in stc:
@@ -279,7 +309,6 @@ jobs:
               stc = re.sub(r'(int vfs_statx\()', decl + r'\1', stc, count=1)
               stc = re.sub(r'(int vfs_statx\([^{]+\{[^\n]*\n(?:[ \t]+[^\n]*;[ \t]*\n)+)',
                            r'\1#ifdef CONFIG_KSU\n\tksu_handle_stat(&dfd, &filename, &flags);\n#endif\n', stc, count=1)
-              # Entferne eventuelle Alt-Hooks aus früheren Tests
               stc = re.sub(r'#ifdef CONFIG_KSU\n\tksu_handle_newfstat_ret.*?\n#endif\n?', '', stc)
               stc = re.sub(r'#ifdef CONFIG_KSU\n\tksu_handle_fstat64_ret.*?\n#endif\n?', '', stc)
               with open("fs/stat.c", "w") as f:
