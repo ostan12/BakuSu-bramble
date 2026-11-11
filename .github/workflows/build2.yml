@@ -44,20 +44,24 @@ jobs:
           # 2. SuSFS 4.19 Basis-Patch anwenden
           patch -p1 --forward < ../susfs4ksu/kernel_patches/50_add_susfs_in_kernel-4.19.patch || true
 
-          # 3. Sicherstellen, dass fs/susfs.o IMMER gebaut wird (behebt alle susfs_* Linkerfehler)
+          # 3. ZWINGEND susfs.o in fs/Makefile fest verdrahten
           sed -i '/susfs.o/d' fs/Makefile
           echo "obj-y += susfs.o" >> fs/Makefile
-          sed -i '1i #ifndef CONFIG_KSU_SUSFS\n#define CONFIG_KSU_SUSFS 1\n#endif\n#ifndef CONFIG_SUSFS\n#define CONFIG_SUSFS 1\n#endif' fs/susfs.c 2>/dev/null || true
 
-          # 4. BakaSU integrieren
+          # 4. In fs/susfs.c sicherstellen, dass die Symbole global sind und die Configs aktiv sind
+          sed -i 's/static DEFINE_IDA(susfs_mnt_id_ida);/DEFINE_IDA(susfs_mnt_id_ida);/g' fs/susfs.c 2>/dev/null || true
+          sed -i 's/static DEFINE_IDA(susfs_mnt_group_ida);/DEFINE_IDA(susfs_mnt_group_ida);/g' fs/susfs.c 2>/dev/null || true
+          sed -i '1i #ifndef CONFIG_KSU_SUSFS\n#define CONFIG_KSU_SUSFS 1\n#endif\n#ifndef CONFIG_SUSFS\n#define CONFIG_SUSFS 1\n#endif\n#ifndef CONFIG_KSU_SUSFS_SUS_MOUNT\n#define CONFIG_KSU_SUSFS_SUS_MOUNT 1\n#endif' fs/susfs.c 2>/dev/null || true
+
+          # 5. BakaSU integrieren
           curl -LSs "https://raw.githubusercontent.com/Baka-SU/BakaSU/main/kernel/setup.sh" | bash -
 
-          # 5. 4.19-Header Fixes
+          # 6. 4.19-Header Fixes
           [ -f drivers/kernelsu/Makefile ] && sed -i 's/static_call.h/static_call_disabled_for_4_19.h/g' drivers/kernelsu/Makefile
           [ -f drivers/kernelsu/kernel_includes.h ] && sed -i 's|#include <linux/static_call.h>|/* disabled on 4.19 */|g' drivers/kernelsu/kernel_includes.h
           [ -f drivers/kernelsu/extension/cpu_spoof.c ] && sed -i 's/->vdso_clock_mode/->rating/g' drivers/kernelsu/extension/cpu_spoof.c
 
-          # 6. Python-Patcher: Hooks setzen und dispatch.c anpassen
+          # 7. Python-Patcher: Löst alle Rejects und Hooks fehlerfrei auf
           python3 - << 'PYEOF'
           import re, os, subprocess
 
@@ -259,7 +263,7 @@ jobs:
                   f.write(oc)
               print("[OK] fs/open.c gepatcht")
 
-          # 6. fs/stat.c -> NUR ksu_handle_stat (keine newfstat_ret/fstat64_ret Aufrufe)
+          # 6. fs/stat.c -> nur ksu_handle_stat
           with open("fs/stat.c", "r") as f:
               stc = f.read()
           if "ksu_handle_stat" not in stc:
