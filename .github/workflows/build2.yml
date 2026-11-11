@@ -40,20 +40,24 @@ jobs:
           # 1. SuSFS-Dateien kopieren
           cp -r ../susfs4ksu/kernel_patches/fs/* fs/
           cp -r ../susfs4ksu/kernel_patches/include/linux/* include/linux/
-          grep -q "susfs.o" fs/Makefile || echo "obj-\$(CONFIG_KSU_SUSFS) += susfs.o" >> fs/Makefile
 
           # 2. SuSFS 4.19 Basis-Patch anwenden
           patch -p1 --forward < ../susfs4ksu/kernel_patches/50_add_susfs_in_kernel-4.19.patch || true
 
-          # 3. BakaSU integrieren
+          # 3. Sicherstellen, dass fs/susfs.o IMMER gebaut wird (behebt alle susfs_* Linkerfehler)
+          sed -i '/susfs.o/d' fs/Makefile
+          echo "obj-y += susfs.o" >> fs/Makefile
+          sed -i '1i #ifndef CONFIG_KSU_SUSFS\n#define CONFIG_KSU_SUSFS 1\n#endif\n#ifndef CONFIG_SUSFS\n#define CONFIG_SUSFS 1\n#endif' fs/susfs.c 2>/dev/null || true
+
+          # 4. BakaSU integrieren
           curl -LSs "https://raw.githubusercontent.com/Baka-SU/BakaSU/main/kernel/setup.sh" | bash -
 
-          # 4. 4.19-Header Fixes
+          # 5. 4.19-Header Fixes
           [ -f drivers/kernelsu/Makefile ] && sed -i 's/static_call.h/static_call_disabled_for_4_19.h/g' drivers/kernelsu/Makefile
           [ -f drivers/kernelsu/kernel_includes.h ] && sed -i 's|#include <linux/static_call.h>|/* disabled on 4.19 */|g' drivers/kernelsu/kernel_includes.h
           [ -f drivers/kernelsu/extension/cpu_spoof.c ] && sed -i 's/->vdso_clock_mode/->rating/g' drivers/kernelsu/extension/cpu_spoof.c
 
-          # 5. Python-Patcher: Löst alle Rejects und Hooks fehlerfrei auf
+          # 6. Python-Patcher: Hooks setzen und dispatch.c anpassen
           python3 - << 'PYEOF'
           import re, os, subprocess
 
@@ -255,18 +259,14 @@ jobs:
                   f.write(oc)
               print("[OK] fs/open.c gepatcht")
 
-          # 6. fs/stat.c -> ksu_handle_stat + newfstat_ret + fstat64_ret (ohne ksu_syms Prüfung)
+          # 6. fs/stat.c -> NUR ksu_handle_stat (keine newfstat_ret/fstat64_ret Aufrufe)
           with open("fs/stat.c", "r") as f:
               stc = f.read()
           if "ksu_handle_stat" not in stc:
-              decl = "#ifdef CONFIG_KSU\nstruct stat;\nstruct stat64;\nextern int ksu_handle_stat(int *dfd, const char __user **filename_user, int *flags);\nextern void ksu_handle_newfstat_ret(unsigned int *fd, struct stat __user **statbuf_ptr);\nextern void ksu_handle_fstat64_ret(unsigned long *fd, struct stat64 __user **statbuf_ptr);\n#endif\n\n"
+              decl = "#ifdef CONFIG_KSU\nstruct stat;\nstruct stat64;\nextern int ksu_handle_stat(int *dfd, const char __user **filename_user, int *flags);\n#endif\n\n"
               stc = re.sub(r'(int vfs_statx\()', decl + r'\1', stc, count=1)
               stc = re.sub(r'(int vfs_statx\([^{]+\{[^\n]*\n(?:[ \t]+[^\n]*;[ \t]*\n)+)',
                            r'\1#ifdef CONFIG_KSU\n\tksu_handle_stat(&dfd, &filename, &flags);\n#endif\n', stc, count=1)
-              stc = re.sub(r'(vfs_fstat\(fd,\s*&stat\);\s*if\s*\(!error\)\s*error\s*=\s*cp_new_stat\(&stat,\s*statbuf\);)',
-                           r'\1\n#ifdef CONFIG_KSU\n\tksu_handle_newfstat_ret(&fd, &statbuf);\n#endif', stc, count=1)
-              stc = re.sub(r'(vfs_fstat\(fd,\s*&stat\);\s*if\s*\(!error\)\s*error\s*=\s*cp_new_stat64\(&stat,\s*statbuf\);)',
-                           r'\1\n#ifdef CONFIG_KSU\n\tksu_handle_fstat64_ret(&fd, &statbuf);\n#endif', stc, count=1)
               with open("fs/stat.c", "w") as f:
                   f.write(stc)
               print("[OK] fs/stat.c gepatcht")
@@ -291,6 +291,7 @@ jobs:
             "CONFIG_KSU_MANUAL_HOOK=y" \
             "CONFIG_KSU_MULTI_MANAGER_SUPPORT=y" \
             "CONFIG_KSU_SUSFS=y" \
+            "CONFIG_SUSFS=y" \
             "CONFIG_KSU_SUSFS_SUS_PATH=y" \
             "CONFIG_KSU_SUSFS_SUS_MOUNT=y" \
             "CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT=y" \
@@ -328,6 +329,7 @@ jobs:
             -e KSU_MANUAL_HOOK \
             -e KSU_MULTI_MANAGER_SUPPORT \
             -e KSU_SUSFS \
+            -e SUSFS \
             -e KSU_SUSFS_SUS_PATH \
             -e KSU_SUSFS_SUS_MOUNT \
             -e KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT \
@@ -345,7 +347,7 @@ jobs:
             olddefconfig
 
           echo "=== Aktive SuSFS- & BakaSU-Konfiguration ==="
-          grep -E "CONFIG_KSU_SUSFS|CONFIG_KSU_MANUAL_HOOK" out/.config || true
+          grep -E "CONFIG_KSU_SUSFS|CONFIG_SUSFS|CONFIG_KSU_MANUAL_HOOK" out/.config || true
 
           if ! make -j$(nproc) O=out ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 \
             CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
