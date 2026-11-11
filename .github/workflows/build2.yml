@@ -69,15 +69,34 @@ jobs:
               susfs_ext = (
                   "\n#ifndef CMD_SUSFS_ADD_SUS_MAP\n"
                   "#define CMD_SUSFS_ADD_SUS_MAP 0x55566\n"
+                  "#endif\n"
+                  "#ifndef CMD_SUSFS_SHOW_SUS_MAP\n"
                   "#define CMD_SUSFS_SHOW_SUS_MAP 0x55567\n"
+                  "#endif\n"
+                  "#ifndef CMD_SUSFS_ADD_SUS_PATH_LOOP\n"
                   "#define CMD_SUSFS_ADD_SUS_PATH_LOOP 0x55568\n"
+                  "#endif\n"
+                  "#ifndef CMD_SUSFS_SHOW_SUS_PATH_LOOP\n"
                   "#define CMD_SUSFS_SHOW_SUS_PATH_LOOP 0x55569\n"
+                  "#endif\n"
+                  "#ifndef CMD_SUSFS_ENABLE_AVC_LOG_SPOOFING\n"
                   "#define CMD_SUSFS_ENABLE_AVC_LOG_SPOOFING 0x5556a\n"
+                  "#endif\n"
+                  "#ifndef CMD_SUSFS_SHOW_AVC_LOG_SPOOFING\n"
                   "#define CMD_SUSFS_SHOW_AVC_LOG_SPOOFING 0x5556b\n"
+                  "#endif\n"
+                  "#ifndef CMD_SUSFS_HIDE_SUS_MNTS_FOR_NON_SU_PROCS\n"
                   "#define CMD_SUSFS_HIDE_SUS_MNTS_FOR_NON_SU_PROCS 0x5556c\n"
+                  "#endif\n"
+                  "#ifndef CMD_SUSFS_SHOW_HIDE_SUS_MNTS_FOR_NON_SU_PROCS\n"
                   "#define CMD_SUSFS_SHOW_HIDE_SUS_MNTS_FOR_NON_SU_PROCS 0x5556d\n"
-                  "#ifndef CL_COPY_MNT_NS\n#define CL_COPY_MNT_NS 0x100\n#endif\n"
-                  "#ifndef CL_ZYGOTE_COPY_MNT_NS\n#define CL_ZYGOTE_COPY_MNT_NS 0x200\n#endif\n"
+                  "#endif\n"
+                  "#ifndef CL_COPY_MNT_NS\n"
+                  "#define CL_COPY_MNT_NS 0x100\n"
+                  "#endif\n"
+                  "#ifndef CL_ZYGOTE_COPY_MNT_NS\n"
+                  "#define CL_ZYGOTE_COPY_MNT_NS 0x200\n"
+                  "#endif\n"
                   "struct st_susfs_sus_map;\n"
                   "struct st_susfs_sus_path_loop;\n"
                   "#define susfs_add_sus_map(...) (0)\n"
@@ -88,7 +107,6 @@ jobs:
                   "#define susfs_show_avc_log_spoofing(...) (0)\n"
                   "#define susfs_hide_sus_mnts_for_non_su_procs(...) (0)\n"
                   "#define susfs_show_hide_sus_mnts_for_non_su_procs(...) (0)\n"
-                  "#endif\n"
               )
               with open("include/linux/susfs.h", "w") as f:
                   f.write(s + susfs_ext)
@@ -99,10 +117,10 @@ jobs:
               c = old = f.read()
           if "susfs_mnt_id_backup" not in c:
               c = re.sub(r'(int\s+mnt_flags;)',
-                         r'\1\n#ifdef CONFIG_KSU_SUSFS\n\tu64 susfs_mnt_id_backup;\n#endif', c, count=1)
+                         r'\1\n#ifdef CONFIG_KSU_SUSFS\n\tu64 susfs_mnt_id_backup;\n#endif\n', c, count=1)
               save_if_changed("include/linux/mount.h", old, c, "susfs_mnt_id_backup")
 
-          # --- C. SuSFS Rejects in fs/namespace.c sauber auflösen ---
+          # --- C. SuSFS Rejects in fs/namespace.c ---
           with open("fs/namespace.c", "r") as f:
               c = old = f.read()
 
@@ -119,10 +137,13 @@ jobs:
               "#ifndef CL_ZYGOTE_COPY_MNT_NS\n#define CL_ZYGOTE_COPY_MNT_NS 0x200\n#endif\n"
               "#endif\n"
           )
-          if "extern bool susfs_is_current_zygote_domain(void);" not in c:
+          if "static DEFINE_IDA(susfs_mnt_id_ida);" not in c:
               c = re.sub(r'(#include\s*<[^>]+>\n)', r'\1' + susfs_top_defs, c, count=1)
 
-          # Definition von mnt_alloc_id auf 3 Argumente erweitern (falls Patch abgewiesen)
+          # Fehlaufruf an Zeile 255 zurücknehmen (falls im Patch-File)
+          c = re.sub(r'\bmnt_alloc_id\(mnt,\s*false,\s*false\)', 'mnt_alloc_id(mnt)', c, count=1)
+
+          # Definition von mnt_alloc_id auf 3 Argumente erweitern
           target_alloc_def = "static int mnt_alloc_id(struct mount *mnt)\n{"
           if target_alloc_def in c:
               alloc_def_3args = (
@@ -148,16 +169,16 @@ jobs:
               )
               c = c.replace(target_alloc_def, alloc_def_3args, 1)
 
-          # Aufrufe in alloc_vfsmnt und clone_mnt auf 3 Argumente anpassen
+          # Aufrufe in alloc_vfsmnt und clone_mnt anpassen
           def_pos = c.find("mnt_alloc_id(")
           if def_pos != -1:
               def_end = c.find("}", def_pos)
               call1 = c.find("err = mnt_alloc_id(mnt);", def_end)
               if call1 != -1:
-                  c = c[:call1] + "#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\n\terr = mnt_alloc_id(mnt, false, false);\n#else\n\terr = mnt_alloc_id(mnt);\n#endif" + c[call1 + len("err = mnt_alloc_id(mnt);"):]
+                  c = c[:call1] + "#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\n\terr = mnt_alloc_id(mnt, false, false);\n#else\n\terr = mnt_alloc_id(mnt);\n#endif\n" + c[call1 + len("err = mnt_alloc_id(mnt);"):]
               call2 = c.find("err = mnt_alloc_id(mnt);", def_end)
               if call2 != -1:
-                  c = c[:call2] + "#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\n\terr = mnt_alloc_id(mnt, (flag & CL_COPY_MNT_NS) ? true : false, (flag & CL_ZYGOTE_COPY_MNT_NS) ? true : false);\n#else\n\terr = mnt_alloc_id(mnt);\n#endif" + c[call2 + len("err = mnt_alloc_id(mnt);"):]
+                  c = c[:call2] + "#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\n\terr = mnt_alloc_id(mnt, (flag & CL_COPY_MNT_NS) ? true : false, (flag & CL_ZYGOTE_COPY_MNT_NS) ? true : false);\n#else\n\terr = mnt_alloc_id(mnt);\n#endif\n" + c[call2 + len("err = mnt_alloc_id(mnt);"):]
 
           save_if_changed("fs/namespace.c", old, c, "SuSFS namespace fixes")
 
@@ -247,7 +268,7 @@ jobs:
               c = re.sub(r'(SYSCALL_DEFINE3\(read,)', decl + r'\1', c, count=1)
               c = re.sub(r'(SYSCALL_DEFINE3\(read,[^{]+\{[^\n]*\n(?:[ \t]+[^\n]*;[ \t]*\n)+)',
                          r'\1#ifdef CONFIG_KSU\n\tksu_handle_sys_read(fd, &buf, &count);\n#endif\n', c, count=1)
-              save_if_changed("fs/read_write.c", old, c, "ksu_handle_sys_read in SYSCALL_DEFINE3(read)")
+              save_if_changed("fs/read_write.c", old, c, "ksu_handle_sys_read")
           PYEOF
 
           # Defconfig für BakaSU + SuSFS
