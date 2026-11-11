@@ -53,11 +53,11 @@ jobs:
           [ -f drivers/kernelsu/kernel_includes.h ] && sed -i 's|#include <linux/static_call.h>|/* disabled on 4.19 */|g' drivers/kernelsu/kernel_includes.h
           [ -f drivers/kernelsu/extension/cpu_spoof.c ] && sed -i 's/->vdso_clock_mode/->rating/g' drivers/kernelsu/extension/cpu_spoof.c
 
-          # 5. Python-Patcher: Dereferenzierung in dispatch.c und alle Hooks auflösen
+          # 5. Python-Patcher: Löst alle Rejects und Hooks fehlerfrei auf
           python3 - << 'PYEOF'
           import re, os, subprocess
 
-          # --- A. include/linux/susfs.h ergänzen (inkl. struct kstat Forward-Decl) ---
+          # --- A. include/linux/susfs.h ergänzen ---
           susfs_h = "include/linux/susfs.h"
           if os.path.exists(susfs_h):
               with open(susfs_h, "r") as f:
@@ -86,14 +86,12 @@ jobs:
                       f.write(extra_susfs + sh)
                   print("[OK] include/linux/susfs.h ergänzt")
 
-          # --- B. dispatch.c: Fehlende Makros + Zeiger-Dereferenzierung fixen ---
+          # --- B. dispatch.c Stubs & Dereferenzierung ---
           for root, dirs, files in os.walk("."):
               if "dispatch.c" in files:
                   fp = os.path.join(root, "dispatch.c")
                   with open(fp, "r") as f:
                       txt = f.read()
-
-                  # 1. Stubs einfügen falls noch nicht vorhanden
                   if "BTI_DISP_STUBS" not in txt:
                       disp_stub = (
                           "#ifndef BTI_DISP_STUBS\n#define BTI_DISP_STUBS 1\n"
@@ -111,11 +109,7 @@ jobs:
                           "#endif\n"
                       )
                       txt = disp_stub + txt
-
-                  # 2. Behebt 'incompatible pointer types passing void **'
-                  # Wandelt susfs_xxx(arg) in susfs_xxx((void *)*arg) um
                   txt = re.sub(r'(susfs_[a-z0-9_]+)\(\s*arg\s*\)', r'\1((void *)*arg)', txt)
-
                   with open(fp, "w") as f:
                       f.write(txt)
                   print(f"[OK] {fp} gepatcht (Zeiger-Dereferenzierung)")
@@ -195,7 +189,7 @@ jobs:
           print("[OK] fs/namespace.c gepatcht")
 
           # --- G. Die 7 BakaSU Pflicht-Hooks ---
-          # 1. drivers/input/input.c (ohne C99-Declaration-Warning)
+          # 1. drivers/input/input.c
           with open("drivers/input/input.c", "r") as f:
               inp = f.read()
           if "ksu_handle_input_handle_event" not in inp:
@@ -261,7 +255,7 @@ jobs:
                   f.write(oc)
               print("[OK] fs/open.c gepatcht")
 
-          # 6. fs/stat.c -> ksu_handle_stat + newfstat_ret + fstat64_ret
+          # 6. fs/stat.c -> ksu_handle_stat + newfstat_ret + fstat64_ret (ohne ksu_syms Prüfung)
           with open("fs/stat.c", "r") as f:
               stc = f.read()
           if "ksu_handle_stat" not in stc:
@@ -269,12 +263,10 @@ jobs:
               stc = re.sub(r'(int vfs_statx\()', decl + r'\1', stc, count=1)
               stc = re.sub(r'(int vfs_statx\([^{]+\{[^\n]*\n(?:[ \t]+[^\n]*;[ \t]*\n)+)',
                            r'\1#ifdef CONFIG_KSU\n\tksu_handle_stat(&dfd, &filename, &flags);\n#endif\n', stc, count=1)
-              if "ksu_handle_newfstat_ret" in ksu_syms:
-                  stc = re.sub(r'(vfs_fstat\(fd,\s*&stat\);\s*if\s*\(!error\)\s*error\s*=\s*cp_new_stat\(&stat,\s*statbuf\);)',
-                             r'\1\n#ifdef CONFIG_KSU\n\tksu_handle_newfstat_ret(&fd, &statbuf);\n#endif', stc, count=1)
-              if "ksu_handle_fstat64_ret" in ksu_syms:
-                  stc = re.sub(r'(vfs_fstat\(fd,\s*&stat\);\s*if\s*\(!error\)\s*error\s*=\s*cp_new_stat64\(&stat,\s*statbuf\);)',
-                             r'\1\n#ifdef CONFIG_KSU\n\tksu_handle_fstat64_ret(&fd, &statbuf);\n#endif', stc, count=1)
+              stc = re.sub(r'(vfs_fstat\(fd,\s*&stat\);\s*if\s*\(!error\)\s*error\s*=\s*cp_new_stat\(&stat,\s*statbuf\);)',
+                           r'\1\n#ifdef CONFIG_KSU\n\tksu_handle_newfstat_ret(&fd, &statbuf);\n#endif', stc, count=1)
+              stc = re.sub(r'(vfs_fstat\(fd,\s*&stat\);\s*if\s*\(!error\)\s*error\s*=\s*cp_new_stat64\(&stat,\s*statbuf\);)',
+                           r'\1\n#ifdef CONFIG_KSU\n\tksu_handle_fstat64_ret(&fd, &statbuf);\n#endif', stc, count=1)
               with open("fs/stat.c", "w") as f:
                   f.write(stc)
               print("[OK] fs/stat.c gepatcht")
