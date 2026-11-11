@@ -46,7 +46,7 @@ jobs:
           [ -f drivers/kernelsu/kernel_includes.h ] && sed -i 's|#include <linux/static_call.h>|/* disabled on 4.19 */|g' drivers/kernelsu/kernel_includes.h
           [ -f drivers/kernelsu/extension/cpu_spoof.c ] && sed -i 's/->vdso_clock_mode/->rating/g' drivers/kernelsu/extension/cpu_spoof.c
 
-          # 5. Python-Patcher: Löst SuSFS-Rejects auf & setzt alle SuSFS-Hooks
+          # 5. Python-Patcher: Löst SuSFS-Rejects auf & setzt alle geforderten Inline-Hooks
           python3 - << 'PYEOF'
           import re, subprocess
 
@@ -62,43 +62,77 @@ jobs:
               else:
                   print(f"[WARN] Muster für {label} in {path} nicht gefunden!")
 
-          # --- A. SuSFS Rejects in include/linux/mount.h auflösen ---
+          # --- A. SuSFS Rejects in include/linux/mount.h ---
           with open("include/linux/mount.h", "r") as f:
               c = old = f.read()
           if "susfs_mnt_id_backup" not in c:
               c = re.sub(r'(int\s+mnt_flags;)',
                          r'\1\n#ifdef CONFIG_KSU_SUSFS\n\tu64 susfs_mnt_id_backup;\n#endif', c, count=1)
-              save_if_changed("include/linux/mount.h", old, c, "susfs_mnt_id_backup in struct vfsmount")
+              save_if_changed("include/linux/mount.h", old, c, "susfs_mnt_id_backup")
 
-          # --- B. SuSFS Flags in include/linux/susfs.h absichern ---
-          with open("include/linux/susfs.h", "r") as f:
-              s = f.read()
-          if "CL_COPY_MNT_NS" not in s:
-              s += "\n#ifndef CL_COPY_MNT_NS\n#define CL_COPY_MNT_NS 0x20\n#endif\n#ifndef CL_ZYGOTE_COPY_MNT_NS\n#define CL_ZYGOTE_COPY_MNT_NS 0x40\n#endif\n"
-              with open("include/linux/susfs.h", "w") as f:
-                  f.write(s)
-              print("[OK] include/linux/susfs.h gepatcht (CL_COPY_MNT_NS)")
-
-          # --- C. SuSFS Rejects in fs/namespace.c auflösen ---
+          # --- B. SuSFS Rejects in fs/namespace.c (Deklarationen + Aufrufe) ---
           with open("fs/namespace.c", "r") as f:
               c = old = f.read()
 
-          # Header direkt nach dem ersten Include einbinden
-          if "<linux/susfs.h>" not in c:
-              c = re.sub(r'(#include\s*<[^>]+>\n)',
-                         r'\1#ifdef CONFIG_KSU_SUSFS\n#include <linux/susfs.h>\n#endif\n', c, count=1)
+          ns_defs = """
+#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
+#include <linux/susfs.h>
+extern bool susfs_is_current_zygote_domain(void);
+extern struct ida susfs_mnt_id_ida;
+extern struct ida susfs_mnt_group_ida;
+#ifndef DEFAULT_SUS_MNT_ID
+#define DEFAULT_SUS_MNT_ID 100000
+#endif
+#ifndef DEFAULT_SUS_MNT_GROUP_ID
+#define DEFAULT_SUS_MNT_GROUP_ID 100000
+#endif
+#ifndef DEFAULT_SUS_MNT_ID_FOR_KSU_PROC_UNSHARE
+#define DEFAULT_SUS_MNT_ID_FOR_KSU_PROC_UNSHARE 1000000
+#endif
+#ifndef CL_COPY_MNT_NS
+#define CL_COPY_MNT_NS 0x20
+#endif
+#ifndef CL_ZYGOTE_COPY_MNT_NS
+#define CL_ZYGOTE_COPY_MNT_NS 0x40
+#endif
+#endif
+"""
+          if "susfs_mnt_id_ida" not in c:
+              c = re.sub(r'(#include\s*<[^>]+>\n)', r'\1' + ns_defs, c, count=1)
 
-          # mnt_alloc_id Aufrufe anpassen: 1. alloc_vfsmnt, 2. clone_mnt
-          c = re.sub(r'\bmnt_alloc_id\(mnt\)', 'mnt_alloc_id(mnt, false, false)', c, count=1)
-          c = re.sub(r'\bmnt_alloc_id\(mnt\)',
-                     'mnt_alloc_id(mnt, (flag & CL_COPY_MNT_NS) ? true : false, (flag & CL_ZYGOTE_COPY_MNT_NS) ? true : false)',
-                     c, count=1)
+          # Punktgenaue Anpassung in alloc_vfsmnt
+          alloc_pos = c.find("alloc_vfsmnt(")
+          if alloc_pos != -1:
+              alloc_call = c.find("err = mnt_alloc_id(mnt);", alloc_pos)
+              if alloc_call != -1 and alloc_call - alloc_pos < 1500:
+                  c = c[:alloc_call] + "#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\n\terr = mnt_alloc_id(mnt, false, false);\n#else\n\terr = mnt_alloc_id(mnt);\n#endif" + c[alloc_call + len("err = mnt_alloc_id(mnt);"):]
 
-          save_if_changed("fs/namespace.c", old, c, "SuSFS namespace fixes")
+          # Punktgenaue Anpassung in clone_mnt
+          clone_pos = c.find("clone_mnt(")
+          if clone_pos != -1:
+              clone_call = c.find("err = mnt_alloc_id(mnt);", clone_pos)
+              if clone_call != -1 and clone_call - clone_pos < 2500:
+                  c = c[:clone_call] + "#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\n\terr = mnt_alloc_id(mnt, (flag & CL_COPY_MNT_NS) ? true : false, (flag & CL_ZYGOTE_COPY_MNT_NS) ? true : false);\n#else\n\terr = mnt_alloc_id(mnt);\n#endif" + c[clone_call + len("err = mnt_alloc_id(mnt);"):]
 
-          # --- D. BakaSU Hooks ---
+          save_if_changed("fs/namespace.c", old, c, "SuSFS namespace definitions and calls")
 
-          # 1. kernel/sys.c -> ksu_handle_setresuid
+          # --- C. BakaSU Hooks ---
+
+          # 1. drivers/input/input.c -> ksu_handle_input_handle_event (Löst Fehler inline_hook_check.mk:58)
+          with open("drivers/input/input.c", "r") as f:
+              c = old = f.read()
+          if "ksu_handle_input_handle_event" not in c:
+              has_input_flag = "ksu_input_hook" in ksu_syms
+              decl = "#ifdef CONFIG_KSU\n"
+              if has_input_flag:
+                  decl += "extern bool ksu_input_hook __read_mostly;\n"
+              decl += "extern int ksu_handle_input_handle_event(unsigned int *type, unsigned int *code, int *value);\n#endif\n\n"
+              c = re.sub(r'(#include\s*[<"][^>"]+[>"]\n)', r'\1' + decl, c, count=1)
+              hook = "#ifdef CONFIG_KSU\n\tif (unlikely(ksu_input_hook))\n\t\tksu_handle_input_handle_event(&type, &code, &value);\n#endif\n" if has_input_flag else "#ifdef CONFIG_KSU\n\tksu_handle_input_handle_event(&type, &code, &value);\n#endif\n"
+              c = re.sub(r'(static void input_handle_event\([^{]+\{\n)', r'\1' + hook, c, count=1)
+              save_if_changed("drivers/input/input.c", old, c, "ksu_handle_input_handle_event")
+
+          # 2. kernel/sys.c -> ksu_handle_setresuid
           with open("kernel/sys.c", "r") as f:
               c = old = f.read()
           if "ksu_handle_setresuid" not in c:
@@ -108,7 +142,7 @@ jobs:
                          r'\1#ifdef CONFIG_KSU\n\tksu_handle_setresuid(ruid, euid, suid);\n#endif\n', c, count=1)
               save_if_changed("kernel/sys.c", old, c, "ksu_handle_setresuid")
 
-          # 2. kernel/reboot.c -> ksu_handle_sys_reboot
+          # 3. kernel/reboot.c -> ksu_handle_sys_reboot
           with open("kernel/reboot.c", "r") as f:
               c = old = f.read()
           if "ksu_handle_sys_reboot" in ksu_syms and "ksu_handle_sys_reboot" not in c:
@@ -118,7 +152,7 @@ jobs:
                          r'\1#ifdef CONFIG_KSU\n\tksu_handle_sys_reboot(magic1, magic2, cmd, &arg);\n#endif\n', c, count=1)
               save_if_changed("kernel/reboot.c", old, c, "ksu_handle_sys_reboot")
 
-          # 3. fs/exec.c -> ksu_handle_execveat
+          # 4. fs/exec.c -> ksu_handle_execveat
           with open("fs/exec.c", "r") as f:
               c = old = f.read()
           if "ksu_handle_execveat" in ksu_syms and "ksu_handle_execveat" not in c:
@@ -128,7 +162,7 @@ jobs:
               c = re.sub(r'(if \(IS_ERR\(filename\)\))', hook + r'\1', c, count=1)
               save_if_changed("fs/exec.c", old, c, "ksu_handle_execveat")
 
-          # 4. fs/open.c -> ksu_handle_faccessat
+          # 5. fs/open.c -> ksu_handle_faccessat
           with open("fs/open.c", "r") as f:
               c = old = f.read()
           if "ksu_handle_faccessat" in ksu_syms and "ksu_handle_faccessat" not in c:
@@ -138,7 +172,7 @@ jobs:
                          r'\1#ifdef CONFIG_KSU\n\tksu_handle_faccessat(&dfd, &filename, &mode, NULL);\n#endif\n', c, count=1)
               save_if_changed("fs/open.c", old, c, "ksu_handle_faccessat")
 
-          # 5. fs/stat.c -> ksu_handle_stat + newfstat_ret + fstat64_ret
+          # 6. fs/stat.c -> ksu_handle_stat + newfstat_ret + fstat64_ret
           with open("fs/stat.c", "r") as f:
               c = old = f.read()
           if "ksu_handle_stat" in ksu_syms and "ksu_handle_stat" not in c:
@@ -162,10 +196,9 @@ jobs:
 
               save_if_changed("fs/stat.c", old, c, "ksu_handle_stat + newfstat_ret + fstat64_ret")
 
-          # 6. fs/read_write.c -> ksu_handle_sys_read (löst 'You lost ksu_handle_sys_read hook')
+          # 7. fs/read_write.c -> ksu_handle_sys_read
           with open("fs/read_write.c", "r") as f:
               c = old = f.read()
-
           if "ksu_handle_sys_read" not in c:
               decl = "#ifdef CONFIG_KSU\nextern int ksu_handle_sys_read(unsigned int fd, char __user **buf_ptr, size_t *count_ptr);\n#endif\n\n"
               c = re.sub(r'(SYSCALL_DEFINE3\(read,)', decl + r'\1', c, count=1)
@@ -199,7 +232,7 @@ jobs:
           git config user.email "builder@local"
           git config user.name "builder"
           git add -A
-          git commit -m "Integrate BakaSU and SuSFS 4.19 with complete hooks" || true
+          git commit -m "Integrate BakaSU and SuSFS 4.19 with input hook" || true
 
       - name: Compile Kernel (Image.lz4)
         run: |
