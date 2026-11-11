@@ -62,7 +62,39 @@ jobs:
               else:
                   print(f"[WARN] Muster für {label} in {path} nicht gefunden!")
 
-          # --- A. SuSFS Rejects in include/linux/mount.h ---
+          # --- A. Fehlende SuSFS v1.5.5 Befehle in include/linux/susfs.h ergänzen ---
+          with open("include/linux/susfs.h", "r") as f:
+              s = f.read()
+          if "CMD_SUSFS_ADD_SUS_MAP" not in s:
+              susfs_ext = (
+                  "\n#ifndef CMD_SUSFS_ADD_SUS_MAP\n"
+                  "#define CMD_SUSFS_ADD_SUS_MAP 0x55566\n"
+                  "#define CMD_SUSFS_SHOW_SUS_MAP 0x55567\n"
+                  "#define CMD_SUSFS_ADD_SUS_PATH_LOOP 0x55568\n"
+                  "#define CMD_SUSFS_SHOW_SUS_PATH_LOOP 0x55569\n"
+                  "#define CMD_SUSFS_ENABLE_AVC_LOG_SPOOFING 0x5556a\n"
+                  "#define CMD_SUSFS_SHOW_AVC_LOG_SPOOFING 0x5556b\n"
+                  "#define CMD_SUSFS_HIDE_SUS_MNTS_FOR_NON_SU_PROCS 0x5556c\n"
+                  "#define CMD_SUSFS_SHOW_HIDE_SUS_MNTS_FOR_NON_SU_PROCS 0x5556d\n"
+                  "#ifndef CL_COPY_MNT_NS\n#define CL_COPY_MNT_NS 0x100\n#endif\n"
+                  "#ifndef CL_ZYGOTE_COPY_MNT_NS\n#define CL_ZYGOTE_COPY_MNT_NS 0x200\n#endif\n"
+                  "struct st_susfs_sus_map;\n"
+                  "struct st_susfs_sus_path_loop;\n"
+                  "#define susfs_add_sus_map(...) (0)\n"
+                  "#define susfs_show_sus_map(...) (0)\n"
+                  "#define susfs_add_sus_path_loop(...) (0)\n"
+                  "#define susfs_show_sus_path_loop(...) (0)\n"
+                  "#define susfs_enable_avc_log_spoofing(...) (0)\n"
+                  "#define susfs_show_avc_log_spoofing(...) (0)\n"
+                  "#define susfs_hide_sus_mnts_for_non_su_procs(...) (0)\n"
+                  "#define susfs_show_hide_sus_mnts_for_non_su_procs(...) (0)\n"
+                  "#endif\n"
+              )
+              with open("include/linux/susfs.h", "w") as f:
+                  f.write(s + susfs_ext)
+              print("[OK] include/linux/susfs.h gepatcht (SuSFS v1.5.5 Makros)")
+
+          # --- B. SuSFS Rejects in include/linux/mount.h ---
           with open("include/linux/mount.h", "r") as f:
               c = old = f.read()
           if "susfs_mnt_id_backup" not in c:
@@ -70,16 +102,7 @@ jobs:
                          r'\1\n#ifdef CONFIG_KSU_SUSFS\n\tu64 susfs_mnt_id_backup;\n#endif', c, count=1)
               save_if_changed("include/linux/mount.h", old, c, "susfs_mnt_id_backup")
 
-          # --- B. SuSFS Konstanten in include/linux/susfs.h absichern ---
-          with open("include/linux/susfs.h", "r") as f:
-              s = f.read()
-          if "CL_COPY_MNT_NS" not in s:
-              s += "\n#ifndef CL_COPY_MNT_NS\n#define CL_COPY_MNT_NS 0x100\n#endif\n#ifndef CL_ZYGOTE_COPY_MNT_NS\n#define CL_ZYGOTE_COPY_MNT_NS 0x200\n#endif\n"
-              with open("include/linux/susfs.h", "w") as f:
-                  f.write(s)
-              print("[OK] include/linux/susfs.h gepatcht (CL_COPY_MNT_NS)")
-
-          # --- C. SuSFS Rejects in fs/namespace.c auflösen ---
+          # --- C. SuSFS Rejects in fs/namespace.c sauber auflösen ---
           with open("fs/namespace.c", "r") as f:
               c = old = f.read()
 
@@ -87,8 +110,8 @@ jobs:
               "\n#ifdef CONFIG_KSU_SUSFS\n"
               "#include <linux/susfs.h>\n"
               "extern bool susfs_is_current_zygote_domain(void);\n"
-              "extern struct ida susfs_mnt_id_ida;\n"
-              "extern struct ida susfs_mnt_group_ida;\n"
+              "static DEFINE_IDA(susfs_mnt_id_ida);\n"
+              "static DEFINE_IDA(susfs_mnt_group_ida);\n"
               "#ifndef DEFAULT_SUS_MNT_ID\n#define DEFAULT_SUS_MNT_ID 100000\n#endif\n"
               "#ifndef DEFAULT_SUS_MNT_GROUP_ID\n#define DEFAULT_SUS_MNT_GROUP_ID 100000\n#endif\n"
               "#ifndef DEFAULT_SUS_MNT_ID_FOR_KSU_PROC_UNSHARE\n#define DEFAULT_SUS_MNT_ID_FOR_KSU_PROC_UNSHARE 1000000\n#endif\n"
@@ -96,21 +119,51 @@ jobs:
               "#ifndef CL_ZYGOTE_COPY_MNT_NS\n#define CL_ZYGOTE_COPY_MNT_NS 0x200\n#endif\n"
               "#endif\n"
           )
-          if "extern struct ida susfs_mnt_id_ida;" not in c:
+          if "extern bool susfs_is_current_zygote_domain(void);" not in c:
               c = re.sub(r'(#include\s*<[^>]+>\n)', r'\1' + susfs_top_defs, c, count=1)
 
-          # Fehlaufruf an Zeile 255 zurücknehmen (falls modifiziert)
-          c = re.sub(r'\bmnt_alloc_id\(mnt,\s*false,\s*false\)', 'mnt_alloc_id(mnt)', c, count=1)
+          # Definition von mnt_alloc_id auf 3 Argumente erweitern (falls Patch abgewiesen)
+          target_alloc_def = "static int mnt_alloc_id(struct mount *mnt)\n{"
+          if target_alloc_def in c:
+              alloc_def_3args = (
+                  "#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\n"
+                  "static int mnt_alloc_id(struct mount *mnt, bool is_copy_mnt_ns, bool is_zygote_copy_mnt_ns)\n"
+                  "{\n"
+                  "\tint res;\n\n"
+                  "\tif (is_copy_mnt_ns) {\n"
+                  "\t\tres = ida_alloc_min(&susfs_mnt_id_ida, DEFAULT_SUS_MNT_ID, GFP_KERNEL);\n"
+                  "\t} else if (is_zygote_copy_mnt_ns) {\n"
+                  "\t\tres = ida_alloc_min(&susfs_mnt_id_ida, DEFAULT_SUS_MNT_ID_FOR_KSU_PROC_UNSHARE, GFP_KERNEL);\n"
+                  "\t} else {\n"
+                  "\t\tres = ida_alloc(&mnt_id_ida, GFP_KERNEL);\n"
+                  "\t}\n"
+                  "\tif (res < 0)\n"
+                  "\t\treturn res;\n"
+                  "\tmnt->mnt_id = res;\n"
+                  "\treturn 0;\n"
+                  "}\n"
+                  "#else\n"
+                  "static int mnt_alloc_id(struct mount *mnt)\n"
+                  "{\n"
+              )
+              c = c.replace(target_alloc_def, alloc_def_3args, 1)
 
-          # 1-Argument Aufrufe von susfs_mnt_alloc_id auf 3 Argumente korrigieren
-          c = re.sub(r'\bsusfs_mnt_alloc_id\(mnt\)', 'susfs_mnt_alloc_id(mnt, false, false)', c, count=1)
-          c = re.sub(r'\bsusfs_mnt_alloc_id\(mnt\)', 'susfs_mnt_alloc_id(mnt, (flag & CL_COPY_MNT_NS) ? true : false, (flag & CL_ZYGOTE_COPY_MNT_NS) ? true : false)', c, count=1)
+          # Aufrufe in alloc_vfsmnt und clone_mnt auf 3 Argumente anpassen
+          def_pos = c.find("mnt_alloc_id(")
+          if def_pos != -1:
+              def_end = c.find("}", def_pos)
+              call1 = c.find("err = mnt_alloc_id(mnt);", def_end)
+              if call1 != -1:
+                  c = c[:call1] + "#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\n\terr = mnt_alloc_id(mnt, false, false);\n#else\n\terr = mnt_alloc_id(mnt);\n#endif" + c[call1 + len("err = mnt_alloc_id(mnt);"):]
+              call2 = c.find("err = mnt_alloc_id(mnt);", def_end)
+              if call2 != -1:
+                  c = c[:call2] + "#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\n\terr = mnt_alloc_id(mnt, (flag & CL_COPY_MNT_NS) ? true : false, (flag & CL_ZYGOTE_COPY_MNT_NS) ? true : false);\n#else\n\terr = mnt_alloc_id(mnt);\n#endif" + c[call2 + len("err = mnt_alloc_id(mnt);"):]
 
           save_if_changed("fs/namespace.c", old, c, "SuSFS namespace fixes")
 
           # --- D. Die 7 BakaSU Pflicht-Hooks ---
 
-          # 1. drivers/input/input.c -> ksu_handle_input_handle_event (ohne fehlendes __read_mostly)
+          # 1. drivers/input/input.c -> ksu_handle_input_handle_event
           with open("drivers/input/input.c", "r") as f:
               c = old = f.read()
           target_input = "static void input_handle_event(struct input_dev *dev,"
@@ -197,7 +250,7 @@ jobs:
               save_if_changed("fs/read_write.c", old, c, "ksu_handle_sys_read in SYSCALL_DEFINE3(read)")
           PYEOF
 
-          # Defconfig vorbereiten
+          # Defconfig für BakaSU + SuSFS
           DEFCONFIG=$(find arch/arm64/configs -name "redbull_defconfig" | head -n 1)
           printf '%s\n' \
             "CONFIG_KSU=y" \
