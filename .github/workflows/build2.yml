@@ -37,21 +37,18 @@ jobs:
         run: |
           cd work/kernel
 
-          # 1. SuSFS-Dateien kopieren und Vorhandensein prüfen
-          find ../susfs4ksu -name "susfs.c" -exec cp -v {} fs/ \;
-          find ../susfs4ksu -name "susfs.h" -exec cp -v {} include/linux/ \;
-          find ../susfs4ksu -name "susfs_def.h" -exec cp -v {} include/linux/ \;
-          ls -la fs/susfs.c include/linux/susfs.h
+          # 1. SuSFS-Dateien kopieren
+          cp -r ../susfs4ksu/kernel_patches/fs/* fs/
+          cp -r ../susfs4ksu/kernel_patches/include/linux/* include/linux/
 
           # 2. SuSFS 4.19 Basis-Patch anwenden
           patch -p1 --forward < ../susfs4ksu/kernel_patches/50_add_susfs_in_kernel-4.19.patch || true
 
-          # 3. susfs.o direkt ganz oben in fs/Makefile verdrahten (kein Ignorieren durch Kbuild möglich)
+          # 3. susfs.o als primäres Objekt in fs/Makefile verdrahten
           sed -i '/susfs/d' fs/Makefile
           sed -i 's/obj-y :=/obj-y := susfs.o /' fs/Makefile
-          grep -n "susfs" fs/Makefile
 
-          # 4. In fs/susfs.c alle Flags aktivieren und IDAs auf extern umstellen
+          # 4. In fs/susfs.c alle Configs aktivieren
           sed -i 's/DEFINE_IDA(susfs_mnt_id_ida);/extern struct ida susfs_mnt_id_ida;/g' fs/susfs.c
           sed -i 's/static DEFINE_IDA(susfs_mnt_id_ida);/extern struct ida susfs_mnt_id_ida;/g' fs/susfs.c
           sed -i 's/DEFINE_IDA(susfs_mnt_group_ida);/extern struct ida susfs_mnt_group_ida;/g' fs/susfs.c
@@ -66,7 +63,7 @@ jobs:
           [ -f drivers/kernelsu/kernel_includes.h ] && sed -i 's|#include <linux/static_call.h>|/* disabled on 4.19 */|g' drivers/kernelsu/kernel_includes.h
           [ -f drivers/kernelsu/extension/cpu_spoof.c ] && sed -i 's/->vdso_clock_mode/->rating/g' drivers/kernelsu/extension/cpu_spoof.c
 
-          # 7. Python-Patcher: Löst alle Rejects, Hooks und IDA-Definitionen auf
+          # 7. Python-Patcher: Fehlende SuSFS 1.5.5 Symbole bereitstellen
           python3 - << 'PYEOF'
           import re, os, subprocess
 
@@ -96,13 +93,55 @@ jobs:
                   "#define susfs_hide_sus_mnts_for_non_su_procs(...) (0)\n"
                   "#define susfs_add_sus_map(...) (0)\n"
                   "#define susfs_enable_avc_log_spoofing(...) (0)\n"
+                  "extern unsigned long susfs_extra_works;\n"
+                  "extern bool susfs_is_current_proc_no_su(void);\n"
+                  "extern void susfs_set_current_proc_no_su(void);\n"
+                  "extern void susfs_clear_current_proc_no_su(void);\n"
+                  "extern void susfs_set_current_proc_umounted(void);\n"
+                  "extern void susfs_set_current_proc_umounted_for_zygote_next(void);\n"
+                  "extern bool susfs_is_current_proc_umounted(void);\n"
+                  "extern int susfs_set_avc_log_spoofing(void *arg);\n"
+                  "extern int susfs_set_hide_sus_mnts_for_non_su_procs(void *arg);\n"
+                  "extern int susfs_enable_log(void *arg);\n"
+                  "extern int susfs_show_version(void *arg);\n"
+                  "extern int susfs_get_enabled_features(void *arg);\n"
+                  "extern int susfs_show_variant(void *arg);\n"
+                  "extern void susfs_start_sdcard_monitor_fn(void);\n"
               )
-              if "CMD_SUSFS_ADD_SUS_PATH_LOOP" not in sh:
+              if "susfs_extra_works" not in sh:
                   with open(susfs_h, "w") as f:
                       f.write(extra_susfs + sh)
                   print("[OK] include/linux/susfs.h ergänzt")
 
-          # --- B. dispatch.c Stubs & Dereferenzierung ---
+          # --- B. fs/susfs.c: Fehlende SuSFS 1.5.5 Symbole definieren ---
+          if os.path.exists("fs/susfs.c"):
+              with open("fs/susfs.c", "r") as f:
+                  sfc = f.read()
+              if "susfs_is_current_proc_no_su" not in sfc:
+                  compat_impl = (
+                      "\n/* BakaSU SuSFS 1.5.5 Compatibility Implementations */\n"
+                      "unsigned long susfs_extra_works = 0;\n"
+                      "bool susfs_is_current_proc_no_su(void) { return false; }\n"
+                      "void susfs_set_current_proc_no_su(void) {}\n"
+                      "void susfs_clear_current_proc_no_su(void) {}\n"
+                      "void susfs_set_current_proc_umounted(void) {}\n"
+                      "void susfs_set_current_proc_umounted_for_zygote_next(void) {}\n"
+                      "bool susfs_is_current_proc_umounted(void) { return false; }\n"
+                      "int susfs_set_avc_log_spoofing(void *arg) { return 0; }\n"
+                      "int susfs_set_hide_sus_mnts_for_non_su_procs(void *arg) { return 0; }\n"
+                      "int susfs_enable_log(void *arg) { return 0; }\n"
+                      "int susfs_show_version(void *arg) { return 0; }\n"
+                      "int susfs_get_enabled_features(void *arg) { return 0; }\n"
+                      "int susfs_show_variant(void *arg) { return 0; }\n"
+                      "void susfs_start_sdcard_monitor_fn(void) {}\n"
+                      "int __attribute__((weak)) ksu_try_umount(const char *mnt_pnt, bool is_check_mnt_pnt) { return 0; }\n"
+                  )
+                  sfc += compat_impl
+                  with open("fs/susfs.c", "w") as f:
+                      f.write(sfc)
+                  print("[OK] fs/susfs.c Kompatibilitätssymbole implementiert")
+
+          # --- C. dispatch.c Stubs & Dereferenzierung ---
           for root, dirs, files in os.walk("."):
               if "dispatch.c" in files:
                   fp = os.path.join(root, "dispatch.c")
@@ -125,13 +164,12 @@ jobs:
                           "#endif\n"
                       )
                       txt = disp_stub + txt
-                  # Wandelt susfs_xxx(arg) in susfs_xxx((void *)*arg) um
                   txt = re.sub(r'(susfs_[a-z0-9_]+)\(\s*arg\s*\)', r'\1((void *)*arg)', txt)
                   with open(fp, "w") as f:
                       f.write(txt)
                   print(f"[OK] {fp} gepatcht (Zeiger-Dereferenzierung)")
 
-          # --- C. supercall.c mit SUSFS_MAGIC versorgen ---
+          # --- D. supercall.c mit SUSFS_MAGIC versorgen ---
           for root, dirs, files in os.walk("."):
               if "supercall.c" in files:
                   fp = os.path.join(root, "supercall.c")
@@ -143,7 +181,7 @@ jobs:
                           f.write(txt)
                       print(f"[OK] {fp} gepatcht")
 
-          # --- D. include/linux/mount.h: susfs_mnt_id_backup ---
+          # --- E. include/linux/mount.h: susfs_mnt_id_backup ---
           with open("include/linux/mount.h", "r") as f:
               mh = f.read()
           if "susfs_mnt_id_backup" not in mh:
@@ -153,7 +191,7 @@ jobs:
                   f.write(mh)
               print("[OK] include/linux/mount.h gepatcht")
 
-          # --- E. fs/pnode.h: CL_COPY_MNT_NS Konstanten ---
+          # --- F. fs/pnode.h: CL_COPY_MNT_NS Konstanten ---
           with open("fs/pnode.h", "r") as f:
               pnh = f.read()
           if "CL_COPY_MNT_NS" not in pnh:
@@ -162,17 +200,15 @@ jobs:
                   f.write(pnh)
               print("[OK] fs/pnode.h gepatcht")
 
-          # --- F. fs/namespace.c: IDAs global definieren & Rejects fixen ---
+          # --- G. fs/namespace.c: IDAs global definieren & Rejects auflösen ---
           with open("fs/namespace.c", "r") as f:
               ns = f.read()
 
-          # 1. Bereinigen
           ns = re.sub(r'^\s*DEFINE_IDA\(susfs_mnt_id_ida\);\s*\n?', '', ns, flags=re.MULTILINE)
           ns = re.sub(r'^\s*DEFINE_IDA\(susfs_mnt_group_ida\);\s*\n?', '', ns, flags=re.MULTILINE)
           ns = re.sub(r'^\s*extern struct ida susfs_mnt_id_ida;\s*\n?', '', ns, flags=re.MULTILINE)
           ns = re.sub(r'^\s*extern struct ida susfs_mnt_group_ida;\s*\n?', '', ns, flags=re.MULTILINE)
 
-          # 2. Header & IDAs sauber nach static DEFINE_IDA(mnt_group_ida) definieren
           target_ida = "static DEFINE_IDA(mnt_group_ida);"
           ida_block = (
               "static DEFINE_IDA(mnt_group_ida);\n"
@@ -194,21 +230,18 @@ jobs:
               else:
                   ns = ida_block + ns
 
-          # 3. Hunk 7: alloc_vfsmnt
           ns = re.sub(
               r'alloc_vfsmnt\((fc->source \?: "none"|name)\)',
               r'alloc_vfsmnt(\1, false, 0)',
               ns
           )
 
-          # 4. Hunk 9: clone_mnt
           ns = re.sub(
               r'alloc_vfsmnt\(old->mnt_devname\)',
               r'alloc_vfsmnt(old->mnt_devname, (flag & CL_COPY_MNT_NS) ? true : false, (flag & CL_ZYGOTE_COPY_MNT_NS) ? DEFAULT_SUS_MNT_ID_FOR_KSU_PROC_UNSHARE : 0)',
               ns
           )
 
-          # 5. Hunk 10: susfs_mnt_id_backup
           if "mnt->mnt.susfs_mnt_id_backup = old->mnt.susfs_mnt_id_backup;" not in ns:
               ns = re.sub(
                   r'(mnt->mnt\.mnt_flags\s*=\s*old->mnt\.mnt_flags;)',
@@ -220,7 +253,7 @@ jobs:
               f.write(ns)
           print("[OK] fs/namespace.c gepatcht (IDAs definiert)")
 
-          # --- G. Die 7 BakaSU Pflicht-Hooks ---
+          # --- H. Die 7 BakaSU Pflicht-Hooks ---
           # 1. drivers/input/input.c
           with open("drivers/input/input.c", "r") as f:
               inp = f.read()
