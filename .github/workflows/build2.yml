@@ -16,7 +16,7 @@ jobs:
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
 
-          # DNS- und Mirror-Fix gegen 'Temporary failure resolving azure.archive.ubuntu.com'
+          # DNS- und Mirror-Fix
           echo -e "nameserver 1.1.1.1\nnameserver 8.8.8.8" | sudo tee /etc/resolv.conf > /dev/null
           sudo sed -i 's|azure.archive.ubuntu.com|archive.ubuntu.com|g' /etc/apt/apt-mirrors.txt 2>/dev/null || true
           sudo sed -i 's|mirror+file:/etc/apt/apt-mirrors.txt|http://archive.ubuntu.com/ubuntu|g' /etc/apt/sources.list.d/ubuntu.sources 2>/dev/null || true
@@ -53,11 +53,11 @@ jobs:
           [ -f drivers/kernelsu/kernel_includes.h ] && sed -i 's|#include <linux/static_call.h>|/* disabled on 4.19 */|g' drivers/kernelsu/kernel_includes.h
           [ -f drivers/kernelsu/extension/cpu_spoof.c ] && sed -i 's/->vdso_clock_mode/->rating/g' drivers/kernelsu/extension/cpu_spoof.c
 
-          # 5. Python-Patcher: Löst Rejects und Makro-Fehler auf
+          # 5. Python-Patcher: Dereferenzierung in dispatch.c und alle Hooks auflösen
           python3 - << 'PYEOF'
           import re, os, subprocess
 
-          # --- A. include/linux/susfs.h ergänzen ---
+          # --- A. include/linux/susfs.h ergänzen (inkl. struct kstat Forward-Decl) ---
           susfs_h = "include/linux/susfs.h"
           if os.path.exists(susfs_h):
               with open(susfs_h, "r") as f:
@@ -73,6 +73,7 @@ jobs:
                   "#ifndef CMD_SUSFS_HIDE_SUS_MNTS_FOR_NON_SU_PROCS\n#define CMD_SUSFS_HIDE_SUS_MNTS_FOR_NON_SU_PROCS 0x5556c\n#endif\n"
                   "#ifndef CMD_SUSFS_ADD_SUS_MAP\n#define CMD_SUSFS_ADD_SUS_MAP 0x55566\n#endif\n"
                   "#ifndef CMD_SUSFS_ENABLE_AVC_LOG_SPOOFING\n#define CMD_SUSFS_ENABLE_AVC_LOG_SPOOFING 0x5556a\n#endif\n"
+                  "struct kstat;\n"
                   "struct st_susfs_sus_path_loop;\n"
                   "struct st_susfs_sus_map;\n"
                   "#define susfs_add_sus_path_loop(...) (0)\n"
@@ -85,12 +86,14 @@ jobs:
                       f.write(extra_susfs + sh)
                   print("[OK] include/linux/susfs.h ergänzt")
 
-          # --- B. dispatch.c Stubs einfügen ---
+          # --- B. dispatch.c: Fehlende Makros + Zeiger-Dereferenzierung fixen ---
           for root, dirs, files in os.walk("."):
               if "dispatch.c" in files:
                   fp = os.path.join(root, "dispatch.c")
                   with open(fp, "r") as f:
                       txt = f.read()
+
+                  # 1. Stubs einfügen falls noch nicht vorhanden
                   if "BTI_DISP_STUBS" not in txt:
                       disp_stub = (
                           "#ifndef BTI_DISP_STUBS\n#define BTI_DISP_STUBS 1\n"
@@ -107,9 +110,15 @@ jobs:
                           "#define susfs_enable_avc_log_spoofing(...) (0)\n"
                           "#endif\n"
                       )
-                      with open(fp, "w") as f:
-                          f.write(disp_stub + txt)
-                      print(f"[OK] {fp} gepatcht")
+                      txt = disp_stub + txt
+
+                  # 2. Behebt 'incompatible pointer types passing void **'
+                  # Wandelt susfs_xxx(arg) in susfs_xxx((void *)*arg) um
+                  txt = re.sub(r'(susfs_[a-z0-9_]+)\(\s*arg\s*\)', r'\1((void *)*arg)', txt)
+
+                  with open(fp, "w") as f:
+                      f.write(txt)
+                  print(f"[OK] {fp} gepatcht (Zeiger-Dereferenzierung)")
 
           # --- C. supercall.c mit SUSFS_MAGIC versorgen ---
           for root, dirs, files in os.walk("."):
@@ -146,7 +155,6 @@ jobs:
           with open("fs/namespace.c", "r") as f:
               ns = f.read()
 
-          # Hunk 1 fix: SuSFS Deklarationen ganz oben einfügen
           hunk1 = (
               "\n#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\n"
               "#include <linux/susfs.h>\n"
@@ -163,21 +171,18 @@ jobs:
           if "extern struct ida susfs_mnt_id_ida;" not in ns:
               ns = hunk1 + ns
 
-          # Hunk 7 fix: vfs_kern_mount ruft alloc_vfsmnt mit 3 Argumenten auf
           ns = re.sub(
               r'alloc_vfsmnt\((fc->source \?: "none"|name)\)',
               r'alloc_vfsmnt(\1, false, 0)',
               ns
           )
 
-          # Hunk 9 fix: clone_mnt ruft alloc_vfsmnt mit 3 Argumenten auf
           ns = re.sub(
               r'alloc_vfsmnt\(old->mnt_devname\)',
               r'alloc_vfsmnt(old->mnt_devname, (flag & CL_COPY_MNT_NS) ? true : false, (flag & CL_ZYGOTE_COPY_MNT_NS) ? DEFAULT_SUS_MNT_ID_FOR_KSU_PROC_UNSHARE : 0)',
               ns
           )
 
-          # Hunk 10 fix: susfs_mnt_id_backup kopieren
           if "mnt->mnt.susfs_mnt_id_backup = old->mnt.susfs_mnt_id_backup;" not in ns:
               ns = re.sub(
                   r'(mnt->mnt\.mnt_flags\s*=\s*old->mnt\.mnt_flags;)',
@@ -264,10 +269,12 @@ jobs:
               stc = re.sub(r'(int vfs_statx\()', decl + r'\1', stc, count=1)
               stc = re.sub(r'(int vfs_statx\([^{]+\{[^\n]*\n(?:[ \t]+[^\n]*;[ \t]*\n)+)',
                            r'\1#ifdef CONFIG_KSU\n\tksu_handle_stat(&dfd, &filename, &flags);\n#endif\n', stc, count=1)
-              stc = re.sub(r'(vfs_fstat\(fd,\s*&stat\);\s*if\s*\(!error\)\s*error\s*=\s*cp_new_stat\(&stat,\s*statbuf\);)',
-                           r'\1\n#ifdef CONFIG_KSU\n\tksu_handle_newfstat_ret(&fd, &statbuf);\n#endif', stc, count=1)
-              stc = re.sub(r'(vfs_fstat\(fd,\s*&stat\);\s*if\s*\(!error\)\s*error\s*=\s*cp_new_stat64\(&stat,\s*statbuf\);)',
-                           r'\1\n#ifdef CONFIG_KSU\n\tksu_handle_fstat64_ret(&fd, &statbuf);\n#endif', stc, count=1)
+              if "ksu_handle_newfstat_ret" in ksu_syms:
+                  stc = re.sub(r'(vfs_fstat\(fd,\s*&stat\);\s*if\s*\(!error\)\s*error\s*=\s*cp_new_stat\(&stat,\s*statbuf\);)',
+                             r'\1\n#ifdef CONFIG_KSU\n\tksu_handle_newfstat_ret(&fd, &statbuf);\n#endif', stc, count=1)
+              if "ksu_handle_fstat64_ret" in ksu_syms:
+                  stc = re.sub(r'(vfs_fstat\(fd,\s*&stat\);\s*if\s*\(!error\)\s*error\s*=\s*cp_new_stat64\(&stat,\s*statbuf\);)',
+                             r'\1\n#ifdef CONFIG_KSU\n\tksu_handle_fstat64_ret(&fd, &statbuf);\n#endif', stc, count=1)
               with open("fs/stat.c", "w") as f:
                   f.write(stc)
               print("[OK] fs/stat.c gepatcht")
