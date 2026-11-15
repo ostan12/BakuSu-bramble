@@ -36,6 +36,7 @@ jobs:
       - name: Apply SuSFS 4.19 Patches & Integrate BakaSU
         run: |
           cd work/kernel
+          cat build.config.redbull* 2>/dev/null || true
 
           # 1. SuSFS-Dateien kopieren
           cp -r ../susfs4ksu/kernel_patches/fs/* fs/
@@ -63,11 +64,30 @@ jobs:
           [ -f drivers/kernelsu/kernel_includes.h ] && sed -i 's|#include <linux/static_call.h>|/* disabled on 4.19 */|g' drivers/kernelsu/kernel_includes.h
           [ -f drivers/kernelsu/extension/cpu_spoof.c ] && sed -i 's/->vdso_clock_mode/->rating/g' drivers/kernelsu/extension/cpu_spoof.c
 
-          # 7. Python-Patcher: Fehlende SuSFS 1.5.5 Symbole, copy_to_user WebUI-Ausgaben & Hooks
+          # 7. Python-Patcher: Module-Loader-Bypass, WebUI copy_to_user & sichere Hooks
           python3 - << 'PYEOF'
           import re, os
 
-          # --- A. include/linux/susfs.h ergänzen ---
+          # --- A. kernel/module.c: Stock vendor_boot Module trotz SuSFS/vermagic laden ---
+          with open("kernel/module.c", "r") as f:
+              mod_c = f.read()
+          mod_c = re.sub(
+              r'(static int check_version\([^{]+\{)',
+              r'\1\n\treturn 1;',
+              mod_c,
+              count=1
+          )
+          mod_c = re.sub(
+              r'(if\s*\(!same_magic\(modmagic,\s*vermagic,\s*info->index\.vers\)\)\s*\{[^}]*?)return\s+-ENOEXEC;',
+              r'\1pr_warn("%s: ignoring vermagic mismatch\\n", info->name);',
+              mod_c,
+              count=1
+          )
+          with open("kernel/module.c", "w") as f:
+              f.write(mod_c)
+          print("[OK] kernel/module.c gepatcht (vermagic & CRC Bypass aktiv)")
+
+          # --- B. include/linux/susfs.h ergänzen ---
           susfs_h = "include/linux/susfs.h"
           if os.path.exists(susfs_h):
               with open(susfs_h, "r") as f:
@@ -113,7 +133,7 @@ jobs:
                       f.write(extra_susfs + sh)
                   print("[OK] include/linux/susfs.h ergänzt")
 
-          # --- B. fs/susfs.c: SuSFS 1.5.5 Symbole + copy_to_user für WebUI ---
+          # --- C. fs/susfs.c: SuSFS 1.5.5 Symbole + copy_to_user für WebUI ---
           if os.path.exists("fs/susfs.c"):
               with open("fs/susfs.c", "r") as f:
                   sfc = f.read()
@@ -200,7 +220,7 @@ jobs:
                       f.write(sfc)
                   print("[OK] fs/susfs.c mit copy_to_user für WebUI implementiert")
 
-          # --- C. dispatch.c Stubs & Dereferenzierung ---
+          # --- D. dispatch.c Stubs & Dereferenzierung ---
           for root, dirs, files in os.walk("."):
               if "dispatch.c" in files:
                   fp = os.path.join(root, "dispatch.c")
@@ -226,9 +246,9 @@ jobs:
                   txt = re.sub(r'(susfs_[a-z0-9_]+)\(\s*arg\s*\)', r'\1((void *)*arg)', txt)
                   with open(fp, "w") as f:
                       f.write(txt)
-                  print(f"[OK] {fp} gepatcht (Zeiger-Dereferenzierung)")
+                  print(f"[OK] {fp} gepatcht")
 
-          # --- D. supercall.c mit SUSFS_MAGIC versorgen ---
+          # --- E. supercall.c mit SUSFS_MAGIC versorgen ---
           for root, dirs, files in os.walk("."):
               if "supercall.c" in files:
                   fp = os.path.join(root, "supercall.c")
@@ -240,7 +260,7 @@ jobs:
                           f.write(txt)
                       print(f"[OK] {fp} gepatcht")
 
-          # --- E. include/linux/mount.h: susfs_mnt_id_backup ---
+          # --- F. include/linux/mount.h: susfs_mnt_id_backup ---
           with open("include/linux/mount.h", "r") as f:
               mh = f.read()
           if "susfs_mnt_id_backup" not in mh:
@@ -250,7 +270,7 @@ jobs:
                   f.write(mh)
               print("[OK] include/linux/mount.h gepatcht")
 
-          # --- F. fs/pnode.h: CL_COPY_MNT_NS Konstanten ---
+          # --- G. fs/pnode.h: CL_COPY_MNT_NS Konstanten ---
           with open("fs/pnode.h", "r") as f:
               pnh = f.read()
           if "CL_COPY_MNT_NS" not in pnh:
@@ -259,7 +279,7 @@ jobs:
                   f.write(pnh)
               print("[OK] fs/pnode.h gepatcht")
 
-          # --- G. fs/namespace.c: IDAs global definieren & Rejects auflösen ---
+          # --- H. fs/namespace.c: IDAs global definieren & Rejects auflösen ---
           with open("fs/namespace.c", "r") as f:
               ns = f.read()
 
@@ -310,9 +330,9 @@ jobs:
 
           with open("fs/namespace.c", "w") as f:
               f.write(ns)
-          print("[OK] fs/namespace.c gepatcht (IDAs definiert)")
+          print("[OK] fs/namespace.c gepatcht")
 
-          # --- H. Die 7 BakaSU Pflicht-Hooks ---
+          # --- I. Die 7 BakaSU Pflicht-Hooks ---
           # 1. drivers/input/input.c
           with open("drivers/input/input.c", "r") as f:
               inp = f.read()
@@ -355,17 +375,21 @@ jobs:
                   f.write(rc)
               print("[OK] kernel/reboot.c gepatcht")
 
-          # 4. fs/exec.c -> ksu_handle_execveat
+          # 4. fs/exec.c -> ksu_handle_execveat NACH IS_ERR(filename) Prüfung!
           with open("fs/exec.c", "r") as f:
               ec = f.read()
           if "ksu_handle_execveat" not in ec:
               decl = "#ifdef CONFIG_KSU\nstruct filename;\nextern int ksu_handle_execveat(int *fd, struct filename **filename_ptr, void *argv, void *envp, int *flags);\n#endif\n\n"
               ec = re.sub(r'(#include\s*[<"][^>"]+[>"])', r'\1\n' + decl, ec, count=1)
-              hook = "#ifdef CONFIG_KSU\n\tksu_handle_execveat(&fd, &filename, &argv, &envp, &flags);\n#endif\n\t"
-              ec = re.sub(r'(if \(IS_ERR\(filename\)\))', hook + r'\1', ec, count=1)
+              ec = re.sub(
+                  r'(if\s*\(IS_ERR\(filename\)\)\s*\n\s*return\s+PTR_ERR\(filename\);)',
+                  r'\1\n#ifdef CONFIG_KSU\n\tksu_handle_execveat(&fd, &filename, &argv, &envp, &flags);\n#endif',
+                  ec,
+                  count=1
+              )
               with open("fs/exec.c", "w") as f:
                   f.write(ec)
-              print("[OK] fs/exec.c gepatcht")
+              print("[OK] fs/exec.c gepatcht (nach IS_ERR)")
 
           # 5. fs/open.c -> ksu_handle_faccessat
           with open("fs/open.c", "r") as f:
@@ -441,15 +465,10 @@ jobs:
             CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
             "$DEFCONFIG_REL"
 
-          # LineageOS no-cfi & Modul-Kompatibilität
+          # Nur CFI deaktivieren (wie build.config.redbull.no-cfi), MODVERSIONS bleibt für Stock-vermagic aktiv
           ./scripts/config --file out/.config \
-            -e THINLTO \
             -d CFI_PERMISSIVE \
             -d CFI_CLANG \
-            -d MODVERSIONS \
-            -d LOCALVERSION_AUTO \
-            -d TRIM_UNUSED_KSYMS \
-            --set-str LOCALVERSION "" \
             -e KSU \
             -e KSU_MANUAL_HOOK \
             -e KSU_MULTI_MANAGER_SUPPORT \
@@ -472,7 +491,7 @@ jobs:
             olddefconfig
 
           echo "=== Aktive Konfiguration ==="
-          grep -E "CONFIG_CFI|CONFIG_MODVERSIONS|CONFIG_LOCALVERSION|CONFIG_KSU_SUSFS" out/.config || true
+          grep -E "CONFIG_CFI|CONFIG_MODVERSIONS|CONFIG_KSU_SUSFS" out/.config || true
 
           if ! make -j$(nproc) O=out ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 \
             CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
@@ -508,15 +527,33 @@ jobs:
           '; }
 
           ### AnyKernel install
-          block=boot;
-          is_slot_device=1;
-          ramdisk_compression=auto;
-          patch_vbmeta_flag=auto;
+          SLOT=$(cat /sys/firmware/devicetree/base/firmware/android/slot_suffix 2>/dev/null | tr -d '\0')
+          [ -z "$SLOT" ] && SLOT=$(getprop ro.boot.slot_suffix 2>/dev/null)
+          [ -z "$SLOT" ] && SLOT=$(grep -oE 'androidboot\.slot_suffix[[:space:]]*=[[:space:]]*"?_?[ab]"?' /proc/bootconfig /proc/cmdline 2>/dev/null | grep -oE '[ab]' | head -n1)
+          case "$SLOT" in
+            a|0|_a) SLOT="_a" ;;
+            b|1|_b) SLOT="_b" ;;
+          esac
 
-          . tools/ak3-core.sh;
+          block=""
+          for u in /sys/class/block/*/uevent; do
+            if grep -q "^PARTNAME=boot${SLOT}$" "$u" 2>/dev/null; then
+              dev=$(grep "^DEVNAME=" "$u" | cut -d= -f2)
+              if [ -b "/dev/block/$dev" ]; then
+                block="/dev/block/$dev"
+                break
+              fi
+            fi
+          done
 
-          split_boot;
-          flash_boot;
+          is_slot_device=0
+          ramdisk_compression=auto
+          patch_vbmeta_flag=auto
+
+          . tools/ak3-core.sh
+
+          split_boot
+          flash_boot
           AKEOF
 
           sed -i 's/^          //' anykernel.sh
