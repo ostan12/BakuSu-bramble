@@ -37,12 +37,17 @@ jobs:
         run: |
           cd work/kernel
 
+          echo "=== LineageOS build.config.redbull* ==="
+          head -n 100 build.config.redbull* build.config.common 2>/dev/null || true
+
           # 1. SuSFS-Dateien kopieren
           cp -r ../susfs4ksu/kernel_patches/fs/* fs/
           cp -r ../susfs4ksu/kernel_patches/include/linux/* include/linux/
 
-          # 2. SuSFS 4.19 Basis-Patch anwenden
+          # 2. SuSFS 4.19 Basis-Patch anwenden & Rejects prüfen
           patch -p1 --forward < ../susfs4ksu/kernel_patches/50_add_susfs_in_kernel-4.19.patch || true
+          echo "=== Gefundene .rej Dateien nach SuSFS-Patch ==="
+          find . -name "*.rej" -exec echo "--- {} ---" \; -exec cat {} \;
 
           # 3. susfs.o als primäres Objekt in fs/Makefile verdrahten
           sed -i '/susfs/d' fs/Makefile
@@ -63,26 +68,11 @@ jobs:
           [ -f drivers/kernelsu/kernel_includes.h ] && sed -i 's|#include <linux/static_call.h>|/* disabled on 4.19 */|g' drivers/kernelsu/kernel_includes.h
           [ -f drivers/kernelsu/extension/cpu_spoof.c ] && sed -i 's/->vdso_clock_mode/->rating/g' drivers/kernelsu/extension/cpu_spoof.c
 
-          # 7. Python-Patcher: Kconfig für Manual-Hook + SuSFS freischalten, Module-Bypass & WebUI
+          # 7. Python-Patcher: Module-Bypass, IDA-Symmetrie, WebUI copy_to_user & sichere Hooks
           python3 - << 'PYEOF'
           import re, os
 
-          # --- A. drivers/kernelsu/Kconfig: Inline-Hook-Zwang entfernen, Manual-Hook erlauben ---
-          ksu_kconfig = "drivers/kernelsu/Kconfig"
-          if os.path.exists(ksu_kconfig):
-              with open(ksu_kconfig, "r") as f:
-                  kc = f.read()
-              print("=== Original drivers/kernelsu/Kconfig ===")
-              print(kc)
-              kc = re.sub(r'^\s*depends on\s+!KSU_SUSFS[^\n]*\n', '', kc, flags=re.MULTILINE)
-              kc = re.sub(r'^\s*depends on\s+KSU_SUSFS\s*=\s*n[^\n]*\n', '', kc, flags=re.MULTILINE)
-              kc = re.sub(r'^\s*select\s+KSU_[A-Z0-9_]*HOOK[^\n]*\n', '', kc, flags=re.MULTILINE)
-              kc = re.sub(r'^(\s*default\s+)KSU_(?:SUSFS_INLINE|INLINE|KPROBES|TRACEPOINT)_HOOK([^\n]*)', r'\1KSU_MANUAL_HOOK', kc, flags=re.MULTILINE)
-              with open(ksu_kconfig, "w") as f:
-                  f.write(kc)
-              print("[OK] drivers/kernelsu/Kconfig für Manual-Hook + SuSFS gepatcht")
-
-          # --- B. kernel/module.c: Stock vendor_boot Module trotz SuSFS/vermagic laden ---
+          # --- A. kernel/module.c: Stock vendor_boot Module trotz SuSFS/vermagic laden ---
           with open("kernel/module.c", "r") as f:
               mod_c = f.read()
           mod_c = re.sub(
@@ -101,7 +91,7 @@ jobs:
               f.write(mod_c)
           print("[OK] kernel/module.c gepatcht (vermagic & CRC Bypass aktiv)")
 
-          # --- C. include/linux/susfs.h ergänzen ---
+          # --- B. include/linux/susfs.h ergänzen ---
           susfs_h = "include/linux/susfs.h"
           if os.path.exists(susfs_h):
               with open(susfs_h, "r") as f:
@@ -147,7 +137,7 @@ jobs:
                       f.write(extra_susfs + sh)
                   print("[OK] include/linux/susfs.h ergänzt")
 
-          # --- D. fs/susfs.c: SuSFS 1.5.5 Symbole + copy_to_user für WebUI ---
+          # --- C. fs/susfs.c: SuSFS 1.5.5 Symbole + copy_to_user für WebUI ---
           if os.path.exists("fs/susfs.c"):
               with open("fs/susfs.c", "r") as f:
                   sfc = f.read()
@@ -234,7 +224,7 @@ jobs:
                       f.write(sfc)
                   print("[OK] fs/susfs.c mit copy_to_user für WebUI implementiert")
 
-          # --- E. dispatch.c Stubs & Dereferenzierung ---
+          # --- D. dispatch.c Stubs & Dereferenzierung ---
           for root, dirs, files in os.walk("."):
               if "dispatch.c" in files:
                   fp = os.path.join(root, "dispatch.c")
@@ -262,7 +252,7 @@ jobs:
                       f.write(txt)
                   print(f"[OK] {fp} gepatcht")
 
-          # --- F. supercall.c mit SUSFS_MAGIC versorgen ---
+          # --- E. supercall.c mit SUSFS_MAGIC versorgen ---
           for root, dirs, files in os.walk("."):
               if "supercall.c" in files:
                   fp = os.path.join(root, "supercall.c")
@@ -274,7 +264,7 @@ jobs:
                           f.write(txt)
                       print(f"[OK] {fp} gepatcht")
 
-          # --- G. include/linux/mount.h: susfs_mnt_id_backup ---
+          # --- F. include/linux/mount.h: susfs_mnt_id_backup ---
           with open("include/linux/mount.h", "r") as f:
               mh = f.read()
           if "susfs_mnt_id_backup" not in mh:
@@ -284,7 +274,7 @@ jobs:
                   f.write(mh)
               print("[OK] include/linux/mount.h gepatcht")
 
-          # --- H. fs/pnode.h: CL_COPY_MNT_NS Konstanten ---
+          # --- G. fs/pnode.h: CL_COPY_MNT_NS Konstanten ---
           with open("fs/pnode.h", "r") as f:
               pnh = f.read()
           if "CL_COPY_MNT_NS" not in pnh:
@@ -293,7 +283,7 @@ jobs:
                   f.write(pnh)
               print("[OK] fs/pnode.h gepatcht")
 
-          # --- I. fs/namespace.c: IDAs global definieren & Rejects auflösen ---
+          # --- H. fs/namespace.c: IDAs global definieren, Rejects auflösen & mnt_free_id absichern ---
           with open("fs/namespace.c", "r") as f:
               ns = f.read()
 
@@ -323,6 +313,16 @@ jobs:
               else:
                   ns = ida_block + ns
 
+          # Sicherstellen, dass mnt_free_id susfs_mnt_id_ida freigibt (falls Hunk fehlgeschlagen war)
+          if "susfs_mnt_id_ida" not in ns[ns.find("mnt_free_id"):ns.find("mnt_free_id")+600]:
+              ns = re.sub(
+                  r'(static void mnt_free_id\(struct mount \*mnt\)\s*\{\s*\n\s*int id = mnt->mnt_id;)',
+                  r'\1\n#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\n\tif (id >= DEFAULT_SUS_MNT_ID) {\n\t\tida_free(&susfs_mnt_id_ida, id - DEFAULT_SUS_MNT_ID);\n\t\treturn;\n\t}\n#endif',
+                  ns,
+                  count=1
+              )
+              print("[OK] mnt_free_id IDA-Freigabe in fs/namespace.c ergänzt")
+
           ns = re.sub(
               r'alloc_vfsmnt\((fc->source \?: "none"|name)\)',
               r'alloc_vfsmnt(\1, false, 0)',
@@ -346,7 +346,7 @@ jobs:
               f.write(ns)
           print("[OK] fs/namespace.c gepatcht")
 
-          # --- J. Die 7 BakaSU Pflicht-Hooks ---
+          # --- I. Die 7 BakaSU Pflicht-Hooks ---
           # 1. drivers/input/input.c
           with open("drivers/input/input.c", "r") as f:
               inp = f.read()
@@ -448,7 +448,6 @@ jobs:
           DEFCONFIG=$(find arch/arm64/configs -name "redbull_defconfig" | head -n 1)
           printf '%s\n' \
             "CONFIG_KSU=y" \
-            "CONFIG_KSU_MANUAL_HOOK=y" \
             "CONFIG_KSU_MULTI_MANAGER_SUPPORT=y" \
             "CONFIG_KSU_SUSFS=y" \
             "CONFIG_SUSFS=y" \
@@ -479,15 +478,15 @@ jobs:
             CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
             "$DEFCONFIG_REL"
 
+          # LineageOS build.config.redbull.no-cfi & Clang-17 4.19-Kompatibilität anwenden
           ./scripts/config --file out/.config \
             -d CFI_PERMISSIVE \
             -d CFI_CLANG \
+            -d SHADOW_CALL_STACK \
+            -d LTO_CLANG \
+            -d THINLTO \
+            -e LTO_NONE \
             -e KSU \
-            -d KSU_SUSFS_INLINE_HOOK \
-            -d KSU_INLINE_HOOK \
-            -d KSU_KPROBES_HOOK \
-            -d KSU_TRACEPOINT_HOOK \
-            -e KSU_MANUAL_HOOK \
             -e KSU_MULTI_MANAGER_SUPPORT \
             -e KSU_SUSFS \
             -e SUSFS \
@@ -507,12 +506,8 @@ jobs:
             CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
             olddefconfig
 
-          echo "=== Aktive KSU/SuSFS Hook-Konfiguration ==="
-          grep -E "CONFIG_KSU|CONFIG_CFI|CONFIG_MODVERSIONS" out/.config || true
-          if ! grep -q "^CONFIG_KSU_MANUAL_HOOK=y" out/.config; then
-            echo "FEHLER: CONFIG_KSU_MANUAL_HOOK ist immer noch nicht aktiv!"
-            exit 1
-          fi
+          echo "=== Aktive KSU/SuSFS & Boot-Konfiguration ==="
+          grep -E "CONFIG_KSU|CONFIG_CFI|CONFIG_SHADOW_CALL_STACK|CONFIG_LTO|CONFIG_MODVERSIONS" out/.config || true
 
           if ! make -j$(nproc) O=out ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 \
             CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
@@ -526,7 +521,8 @@ jobs:
         run: |
           cd work
           cp kernel/out/arch/arm64/boot/Image.lz4 AnyKernel3/
-          zip -r9 "$GITHUB_WORKSPACE/BakaSU-SuSFS-bramble.zip" AnyKernel3/* -x .git README.md *placeholder
+          cd AnyKernel3
+          zip -r9 "$GITHUB_WORKSPACE/BakaSU-SuSFS-bramble.zip" * -x .git README.md *placeholder
 
       - name: Upload Kernel ZIP
         uses: actions/upload-artifact@v4
