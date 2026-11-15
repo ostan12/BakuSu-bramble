@@ -63,22 +63,24 @@ jobs:
           [ -f drivers/kernelsu/kernel_includes.h ] && sed -i 's|#include <linux/static_call.h>|/* disabled on 4.19 */|g' drivers/kernelsu/kernel_includes.h
           [ -f drivers/kernelsu/extension/cpu_spoof.c ] && sed -i 's/->vdso_clock_mode/->rating/g' drivers/kernelsu/extension/cpu_spoof.c
 
-          # 7. Python-Patcher: Manual-Hook erzwingen (verhindert patch_memory Crash auf 4.19), Module-Bypass & WebUI
+          # 7. Python-Patcher: Kconfig für Manual-Hook + SuSFS freischalten, Module-Bypass & WebUI
           python3 - << 'PYEOF'
           import re, os
 
-          # --- A. drivers/kernelsu/Kconfig: Manual Hook auch bei aktivem SuSFS erlauben ---
+          # --- A. drivers/kernelsu/Kconfig: Inline-Hook-Zwang entfernen, Manual-Hook erlauben ---
           ksu_kconfig = "drivers/kernelsu/Kconfig"
           if os.path.exists(ksu_kconfig):
               with open(ksu_kconfig, "r") as f:
                   kc = f.read()
-              # Entferne Abhängigkeiten, die KSU_MANUAL_HOOK bei SuSFS blockieren
-              kc = re.sub(r'depends on\s+!KSU_SUSFS[^\n]*\n', '', kc)
-              # Setze default im Hook-Choice auf KSU_MANUAL_HOOK
-              kc = re.sub(r'(choice\s*\n\s*prompt\s*"[^"]*Hook[^"]*"[^\n]*\n)', r'\1\tdefault KSU_MANUAL_HOOK\n', kc, flags=re.IGNORECASE)
+              print("=== Original drivers/kernelsu/Kconfig ===")
+              print(kc)
+              kc = re.sub(r'^\s*depends on\s+!KSU_SUSFS[^\n]*\n', '', kc, flags=re.MULTILINE)
+              kc = re.sub(r'^\s*depends on\s+KSU_SUSFS\s*=\s*n[^\n]*\n', '', kc, flags=re.MULTILINE)
+              kc = re.sub(r'^\s*select\s+KSU_[A-Z0-9_]*HOOK[^\n]*\n', '', kc, flags=re.MULTILINE)
+              kc = re.sub(r'^(\s*default\s+)KSU_(?:SUSFS_INLINE|INLINE|KPROBES|TRACEPOINT)_HOOK([^\n]*)', r'\1KSU_MANUAL_HOOK', kc, flags=re.MULTILINE)
               with open(ksu_kconfig, "w") as f:
                   f.write(kc)
-              print("[OK] drivers/kernelsu/Kconfig für Manual-Hook + SuSFS geöffnet")
+              print("[OK] drivers/kernelsu/Kconfig für Manual-Hook + SuSFS gepatcht")
 
           # --- B. kernel/module.c: Stock vendor_boot Module trotz SuSFS/vermagic laden ---
           with open("kernel/module.c", "r") as f:
@@ -481,6 +483,10 @@ jobs:
             -d CFI_PERMISSIVE \
             -d CFI_CLANG \
             -e KSU \
+            -d KSU_SUSFS_INLINE_HOOK \
+            -d KSU_INLINE_HOOK \
+            -d KSU_KPROBES_HOOK \
+            -d KSU_TRACEPOINT_HOOK \
             -e KSU_MANUAL_HOOK \
             -e KSU_MULTI_MANAGER_SUPPORT \
             -e KSU_SUSFS \
@@ -503,6 +509,10 @@ jobs:
 
           echo "=== Aktive KSU/SuSFS Hook-Konfiguration ==="
           grep -E "CONFIG_KSU|CONFIG_CFI|CONFIG_MODVERSIONS" out/.config || true
+          if ! grep -q "^CONFIG_KSU_MANUAL_HOOK=y" out/.config; then
+            echo "FEHLER: CONFIG_KSU_MANUAL_HOOK ist immer noch nicht aktiv!"
+            exit 1
+          fi
 
           if ! make -j$(nproc) O=out ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 \
             CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
