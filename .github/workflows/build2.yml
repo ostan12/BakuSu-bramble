@@ -370,11 +370,6 @@ jobs:
             "CONFIG_KALLSYMS=y" \
             "CONFIG_KALLSYMS_ALL=y" >> "$DEFCONFIG"
 
-          git config user.email "builder@local"
-          git config user.name "builder"
-          git add -A
-          git commit -m "Integrate BakaSU and SuSFS 4.19 cleanly" || true
-
       - name: Compile Kernel (Image.lz4)
         run: |
           set -o pipefail
@@ -387,7 +382,15 @@ jobs:
             CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
             "$DEFCONFIG_REL"
 
+          # LineageOS no-cfi & Modul-Kompatibilität (verhindert CFI-Panic & CRC-Abweisung der vendor_boot-Module)
           ./scripts/config --file out/.config \
+            -e THINLTO \
+            -d CFI_PERMISSIVE \
+            -d CFI_CLANG \
+            -d MODVERSIONS \
+            -d LOCALVERSION_AUTO \
+            -d TRIM_UNUSED_KSYMS \
+            --set-str LOCALVERSION "" \
             -e KSU \
             -e KSU_MANUAL_HOOK \
             -e KSU_MULTI_MANAGER_SUPPORT \
@@ -409,8 +412,8 @@ jobs:
             CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
             olddefconfig
 
-          echo "=== Aktive SuSFS- & BakaSU-Konfiguration ==="
-          grep -E "CONFIG_KSU_SUSFS|CONFIG_SUSFS|CONFIG_KSU_MANUAL_HOOK" out/.config || true
+          echo "=== Aktive Konfiguration ==="
+          grep -E "CONFIG_CFI|CONFIG_MODVERSIONS|CONFIG_LOCALVERSION|CONFIG_KSU_SUSFS" out/.config || true
 
           if ! make -j$(nproc) O=out ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 \
             CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
@@ -423,18 +426,42 @@ jobs:
       - name: Package AnyKernel3
         run: |
           cd work
-          for img in Image.lz4-dtb Image.lz4 Image.gz-dtb Image.gz Image; do
-            if [ -f "kernel/out/arch/arm64/boot/$img" ]; then
-              cp "kernel/out/arch/arm64/boot/$img" AnyKernel3/
-              break
-            fi
-          done
+          cp kernel/out/arch/arm64/boot/Image.lz4 AnyKernel3/
 
           cd AnyKernel3
-          sed -i 's/device.name1=maguro/device.name1=bramble/' anykernel.sh
-          sed -i 's/device.name2=toro/device.name2=redfin/' anykernel.sh
-          sed -i 's|BLOCK=.*;|BLOCK=/dev/block/bootdevice/by-name/boot;|' anykernel.sh
-          sed -i 's/IS_SLOT_DEVICE=0;/IS_SLOT_DEVICE=1;/' anykernel.sh
+          cat << 'AKEOF' > anykernel.sh
+          ### AnyKernel setup
+          properties() { '
+          kernel.string=BakaSU-SuSFS-bramble
+          do.devicecheck=1
+          do.modules=0
+          do.systemless=1
+          do.cleanup=1
+          do.cleanuponabort=0
+          device.name1=bramble
+          device.name2=redfin
+          device.name3=
+          device.name4=
+          device.name5=
+          supported.versions=
+          supported.patchlevels=
+          supported.sdk=
+          '; }
+
+          ### AnyKernel install
+          block=boot;
+          is_slot_device=1;
+          ramdisk_compression=auto;
+          patch_vbmeta_flag=auto;
+
+          . tools/ak3-core.sh;
+
+          split_boot;
+          flash_boot;
+          AKEOF
+
+          # Führende Einrückung in anykernel.sh entfernen
+          sed -i 's/^          //' anykernel.sh
           zip -r9 "$GITHUB_WORKSPACE/BakaSU-SuSFS-bramble.zip" * -x .git README.md *placeholder
 
       - name: Upload Kernel ZIP
