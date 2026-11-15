@@ -63,9 +63,9 @@ jobs:
           [ -f drivers/kernelsu/kernel_includes.h ] && sed -i 's|#include <linux/static_call.h>|/* disabled on 4.19 */|g' drivers/kernelsu/kernel_includes.h
           [ -f drivers/kernelsu/extension/cpu_spoof.c ] && sed -i 's/->vdso_clock_mode/->rating/g' drivers/kernelsu/extension/cpu_spoof.c
 
-          # 7. Python-Patcher: Fehlende SuSFS 1.5.5 Symbole bereitstellen
+          # 7. Python-Patcher: Fehlende SuSFS 1.5.5 Symbole & Hooks bereitstellen
           python3 - << 'PYEOF'
-          import re, os, subprocess
+          import re, os
 
           # --- A. include/linux/susfs.h ergänzen ---
           susfs_h = "include/linux/susfs.h"
@@ -113,7 +113,7 @@ jobs:
                       f.write(extra_susfs + sh)
                   print("[OK] include/linux/susfs.h ergänzt")
 
-          # --- B. fs/susfs.c: Fehlende SuSFS 1.5.5 Symbole definieren ---
+          # --- B. fs/susfs.c: Fehlende SuSFS 1.5.5 Symbole & korrekte ksu_try_umount Signatur ---
           if os.path.exists("fs/susfs.c"):
               with open("fs/susfs.c", "r") as f:
                   sfc = f.read()
@@ -134,7 +134,7 @@ jobs:
                       "int susfs_get_enabled_features(void *arg) { return 0; }\n"
                       "int susfs_show_variant(void *arg) { return 0; }\n"
                       "void susfs_start_sdcard_monitor_fn(void) {}\n"
-                      "int __attribute__((weak)) ksu_try_umount(const char *mnt_pnt, bool is_check_mnt_pnt) { return 0; }\n"
+                      "void __attribute__((weak)) ksu_try_umount(const char *mnt, bool check_mnt, int flags, uid_t uid) {}\n"
                   )
                   sfc += compat_impl
                   with open("fs/susfs.c", "w") as f:
