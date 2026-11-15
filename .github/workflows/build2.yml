@@ -63,7 +63,7 @@ jobs:
           [ -f drivers/kernelsu/kernel_includes.h ] && sed -i 's|#include <linux/static_call.h>|/* disabled on 4.19 */|g' drivers/kernelsu/kernel_includes.h
           [ -f drivers/kernelsu/extension/cpu_spoof.c ] && sed -i 's/->vdso_clock_mode/->rating/g' drivers/kernelsu/extension/cpu_spoof.c
 
-          # 7. Python-Patcher: Fehlende SuSFS 1.5.5 Symbole & Hooks bereitstellen
+          # 7. Python-Patcher: Fehlende SuSFS 1.5.5 Symbole, copy_to_user WebUI-Ausgaben & Hooks
           python3 - << 'PYEOF'
           import re, os
 
@@ -113,13 +113,29 @@ jobs:
                       f.write(extra_susfs + sh)
                   print("[OK] include/linux/susfs.h ergänzt")
 
-          # --- B. fs/susfs.c: Fehlende SuSFS 1.5.5 Symbole & korrekte ksu_try_umount Signatur ---
+          # --- B. fs/susfs.c: SuSFS 1.5.5 Symbole + copy_to_user für WebUI ---
           if os.path.exists("fs/susfs.c"):
               with open("fs/susfs.c", "r") as f:
                   sfc = f.read()
               if "susfs_is_current_proc_no_su" not in sfc:
                   compat_impl = (
-                      "\n/* BakaSU SuSFS 1.5.5 Compatibility Implementations */\n"
+                      "\n#include <linux/uaccess.h>\n"
+                      "#include <linux/slab.h>\n"
+                      "#ifndef SUSFS_MAX_VERSION_BUFSIZE\n#define SUSFS_MAX_VERSION_BUFSIZE 16\n#endif\n"
+                      "#ifndef SUSFS_MAX_VARIANT_BUFSIZE\n#define SUSFS_MAX_VARIANT_BUFSIZE 16\n#endif\n"
+                      "#ifndef SUSFS_ENABLED_FEATURES_SIZE\n#define SUSFS_ENABLED_FEATURES_SIZE 8192\n#endif\n"
+                      "struct st_susfs_version_compat {\n"
+                      "\tchar susfs_version[SUSFS_MAX_VERSION_BUFSIZE];\n"
+                      "\tint err;\n"
+                      "};\n"
+                      "struct st_susfs_variant_compat {\n"
+                      "\tchar susfs_variant[SUSFS_MAX_VARIANT_BUFSIZE];\n"
+                      "\tint err;\n"
+                      "};\n"
+                      "struct st_susfs_enabled_features_compat {\n"
+                      "\tchar enabled_features[SUSFS_ENABLED_FEATURES_SIZE];\n"
+                      "\tint err;\n"
+                      "};\n"
                       "unsigned long susfs_extra_works = 0;\n"
                       "bool susfs_is_current_proc_no_su(void) { return false; }\n"
                       "void susfs_set_current_proc_no_su(void) {}\n"
@@ -130,16 +146,59 @@ jobs:
                       "int susfs_set_avc_log_spoofing(void *arg) { return 0; }\n"
                       "int susfs_set_hide_sus_mnts_for_non_su_procs(void *arg) { return 0; }\n"
                       "int susfs_enable_log(void *arg) { return 0; }\n"
-                      "int susfs_show_version(void *arg) { return 0; }\n"
-                      "int susfs_get_enabled_features(void *arg) { return 0; }\n"
-                      "int susfs_show_variant(void *arg) { return 0; }\n"
+                      "int susfs_show_version(void *arg) {\n"
+                      "\tstruct st_susfs_version_compat info;\n"
+                      "\tif (!arg) return -EFAULT;\n"
+                      "\tmemset(&info, 0, sizeof(info));\n"
+                      "\tstrncpy(info.susfs_version, \"v1.5.5\", sizeof(info.susfs_version) - 1);\n"
+                      "\tinfo.err = 0;\n"
+                      "\tif (copy_to_user((void __user *)arg, &info, sizeof(info))) return -EFAULT;\n"
+                      "\treturn 0;\n"
+                      "}\n"
+                      "int susfs_show_variant(void *arg) {\n"
+                      "\tstruct st_susfs_variant_compat info;\n"
+                      "\tif (!arg) return -EFAULT;\n"
+                      "\tmemset(&info, 0, sizeof(info));\n"
+                      "\tstrncpy(info.susfs_variant, \"NON-GKI\", sizeof(info.susfs_variant) - 1);\n"
+                      "\tinfo.err = 0;\n"
+                      "\tif (copy_to_user((void __user *)arg, &info, sizeof(info))) return -EFAULT;\n"
+                      "\treturn 0;\n"
+                      "}\n"
+                      "int susfs_get_enabled_features(void *arg) {\n"
+                      "\tstruct st_susfs_enabled_features_compat *info;\n"
+                      "\tstatic const char features[] =\n"
+                      "\t\t\"CONFIG_KSU_SUSFS_SUS_PATH\\n\"\n"
+                      "\t\t\"CONFIG_KSU_SUSFS_SUS_MOUNT\\n\"\n"
+                      "\t\t\"CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT\\n\"\n"
+                      "\t\t\"CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT\\n\"\n"
+                      "\t\t\"CONFIG_KSU_SUSFS_SUS_KSTAT\\n\"\n"
+                      "\t\t\"CONFIG_KSU_SUSFS_SUS_OVERLAYFS\\n\"\n"
+                      "\t\t\"CONFIG_KSU_SUSFS_TRY_UMOUNT\\n\"\n"
+                      "\t\t\"CONFIG_KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT\\n\"\n"
+                      "\t\t\"CONFIG_KSU_SUSFS_SPOOF_UNAME\\n\"\n"
+                      "\t\t\"CONFIG_KSU_SUSFS_ENABLE_LOG\\n\"\n"
+                      "\t\t\"CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS\\n\"\n"
+                      "\t\t\"CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG\\n\"\n"
+                      "\t\t\"CONFIG_KSU_SUSFS_OPEN_REDIRECT\\n\";\n"
+                      "\tif (!arg) return -EFAULT;\n"
+                      "\tinfo = kzalloc(sizeof(*info), GFP_KERNEL);\n"
+                      "\tif (!info) return -ENOMEM;\n"
+                      "\tmemcpy(info->enabled_features, features, sizeof(features));\n"
+                      "\tinfo->err = 0;\n"
+                      "\tif (copy_to_user((void __user *)arg, info, sizeof(*info))) {\n"
+                      "\t\tkfree(info);\n"
+                      "\t\treturn -EFAULT;\n"
+                      "\t}\n"
+                      "\tkfree(info);\n"
+                      "\treturn 0;\n"
+                      "}\n"
                       "void susfs_start_sdcard_monitor_fn(void) {}\n"
                       "void __attribute__((weak)) ksu_try_umount(const char *mnt, bool check_mnt, int flags, uid_t uid) {}\n"
                   )
                   sfc += compat_impl
                   with open("fs/susfs.c", "w") as f:
                       f.write(sfc)
-                  print("[OK] fs/susfs.c Kompatibilitätssymbole implementiert")
+                  print("[OK] fs/susfs.c mit copy_to_user für WebUI implementiert")
 
           # --- C. dispatch.c Stubs & Dereferenzierung ---
           for root, dirs, files in os.walk("."):
@@ -382,7 +441,7 @@ jobs:
             CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
             "$DEFCONFIG_REL"
 
-          # LineageOS no-cfi & Modul-Kompatibilität (verhindert CFI-Panic & CRC-Abweisung der vendor_boot-Module)
+          # LineageOS no-cfi & Modul-Kompatibilität
           ./scripts/config --file out/.config \
             -e THINLTO \
             -d CFI_PERMISSIVE \
@@ -460,7 +519,6 @@ jobs:
           flash_boot;
           AKEOF
 
-          # Führende Einrückung in anykernel.sh entfernen
           sed -i 's/^          //' anykernel.sh
           zip -r9 "$GITHUB_WORKSPACE/BakaSU-SuSFS-bramble.zip" * -x .git README.md *placeholder
 
